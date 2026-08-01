@@ -1,0 +1,17 @@
+# 기본을 '모두 무시'로 두고 올릴 것만 열어 준다.
+# 강의 영상·전사문·강의자료는 대학 저작물이며 인터넷 배포가 금지되어 있으므로,
+# 실수로도 올라가지 않게 허용 목록 방식을 쓴다.
+*
+
+!.gitignore
+!LICENSE
+!README.md
+!CLAUDE.md
+!사용법.md
+!설정.ini
+!Transcriber 실행.bat
+
+!engine/
+engine/*
+!engine/transcribe.py
+!engine/문단화_검증.py
