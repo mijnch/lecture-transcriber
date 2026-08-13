@@ -10,8 +10,8 @@ if not exist "%PY%" (
     echo  [오류] 전사 엔진을 찾을 수 없습니다.
     echo         %PY%
     echo.
-    echo  Transcriber 폴더를 옮기거나 복사한 경우 engine 폴더가 함께 있는지 확인하고,
-    echo  그래도 안 되면 사용법.md 의 "문제가 생겼을 때" 항목을 참고해주세요.
+    echo  이 폴더의 "환경 설치.bat" 을 실행하면 만들어집니다.
+    echo  (다른 PC로 옮겨 온 경우에도 그것부터 실행하세요.)
     echo.
     pause
     exit /b 1
@@ -23,8 +23,9 @@ rem 그때 원인 불명 오류가 뜨는 대신 무엇이 문제인지 알려�
 if errorlevel 1 (
     echo.
     echo  [오류] 전사 엔진을 실행할 수 없습니다.
-    echo         engine\venv 는 이 PC에 설치된 Python 3.14 를 참고하도록 되어 있습니다.
-    echo         Python 을 지우거나 옮겼다면 engine\venv 를 다시 만들어야 합니다.
+    echo         engine\venv 는 만들어진 PC의 Python 3.14 를 참고하도록 되어 있어
+    echo         다른 PC로 옮기면 그대로 쓸 수 없습니다.
+    echo         이 폴더의 "환경 설치.bat" 을 실행하면 새로 만들어집니다.
     echo.
     pause
     exit /b 1
