@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    # 이 도구는 Windows 전용이므로 실제 대상 플랫폼에서 검증한다.
+    runs-on: windows-latest
+
+    # pwsh(PowerShell 7)는 스크립트를 UTF-8로 읽는다. Windows PowerShell 5.1이나
+    # cmd 는 한글이 든 파일 이름을 깨뜨리므로 여기서는 쓰지 않는다.
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      PYTHONUTF8: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 단위 검증 59개
+        # 표준 라이브러리만으로 도는 검증이다. 모델·ffmpeg·Tesseract 없이,
+        # 몇 시간짜리 전사 없이 문단화·OCR 판정·PDF 정합·산출물 형식을 확인한다.
+        run: python "engine/문단화_검증.py"
+
+      - name: 엔진 구문 검사
+        run: python -m compileall -q engine

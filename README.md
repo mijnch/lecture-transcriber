@@ -1,23 +1,76 @@
 # lecture-transcriber
 
+[![tests](https://github.com/mijnch/lecture-transcriber/actions/workflows/tests.yml/badge.svg)](https://github.com/mijnch/lecture-transcriber/actions/workflows/tests.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > 녹화 강의(MP4)를 **LLM이 원본 그대로 이해할 수 있는 Markdown**으로 바꾸는 로컬 도구.
 > 말소리뿐 아니라 화면의 슬라이드까지 읽어 시간순으로 엮고, **믿을 수 없는 대목에는 표식을 붙인다.**
 
-*A local pipeline that turns recorded lectures into LLM-readable Markdown — transcribing speech,
-reading on-screen slides, aligning them to the original course PDF, and flagging the parts
-that cannot be trusted.*
+| | |
+|---|---|
+| **입력 → 출력** | MP4(+강의노트 PDF) → 타임스탬프 Markdown |
+| **동작 방식** | 전부 로컬 (faster-whisper · Tesseract · ffmpeg). 업로드 없음, 용량 제한 없음 |
+| **처리 속도** | 1시간 영상당 27~43분 (슬라이드 읽기 포함) |
+| **실적** | 9개 강의 318분 무인 처리, 실패 0 · 한글 슬라이드 3,160줄 중 **파손 0줄** |
+| **검증** | 단위 검증 59개, 1초 내 완료 (산출물 생성 포함) |
+| **설치** | `환경 설치.bat` 더블클릭 |
+
+<details>
+<summary><b>In English</b></summary>
+
+A local pipeline that turns recorded university lectures into **LLM-readable Markdown**.
+
+Plain speech-to-text loses two things: everything that was *on the screen*, and any signal about
+which sentences can be trusted. ASR occasionally produces **fluent nonsense** that neither a human
+nor an LLM can detect — quote it and you have invented a fact.
+
+So this tool interleaves three channels in one document:
+
+- **speech** — sequential faster-whisper decoding with quality gates and precise timestamps
+- **screen** — scene-change detection → OCR, with per-line language selection
+- **ground truth** — when the original lecture-note PDF is available, OCR is used only as a
+  *key to identify which page is on screen*, and the body text is replaced with the PDF original
+
+Every paragraph that the decoder was unsure about is marked `⚠`. Text that came from a video
+played *during* the lecture — not from the professor — is marked `📺`. Slides backed by the PDF
+carry a page number.
+
+Runs fully offline on a laptop CPU (no CUDA required). Windows-first; Korean UI.
+Every design decision below was settled by measurement, not preference.
+
+</details>
 
 ---
 
-## 왜 만들었나
+## 어떻게 동작하나
 
-LLM에게 강의를 이해시키려면 텍스트로 줘야 하는데, 단순 전사는 두 가지가 부족했다.
+```mermaid
+flowchart TD
+    MP4[MP4 강의 영상] --> A[ffmpeg<br/>오디오 추출]
+    MP4 --> S[ffmpeg<br/>장면 전환 검출]
+    PDF[(강의노트 PDF<br/>선택)] --> H[전문용어 추출]
+    PDF --> P[쪽별 원문]
 
-1. **화면이 통째로 빠진다.** 교수가 "여기 보시면"이라고 말한 대목의 내용이 사라진다.
-2. **틀린 문장과 맞은 문장이 구별되지 않는다.** 음성 인식은 가끔 *유창한 헛소리*를 만든다.
-   사람도 LLM도 이것을 알아볼 수 없고, 그대로 인용하면 허위 사실이 된다.
+    H -.hotwords.-> W
+    A --> W[faster-whisper 순차 전사<br/>품질 게이트 · 온도 폴백]
+    W --> Q{구간별 신뢰도<br/>avg_logprob · 반복}
+    Q --> PARA[문단<br/>문장 중간에서 끊지 않음]
 
-그래서 이 도구는 **말 + 화면 + 신뢰도**를 함께 싣는다.
+    S --> F[전환 프레임]
+    F --> O[Tesseract 2패스<br/>kor·eng 따로]
+    O --> L[줄 높이로 맞대어<br/>줄마다 확신도로 선택]
+    L --> M[유사 슬라이드 병합]
+
+    M --> AL{2연쇄 대조로<br/>PDF 쪽 찾기}
+    P --> AL
+    AL -->|찾음| REP[본문을 PDF 원문으로 교체<br/>+ 쪽번호]
+    AL -->|못 찾음| KEEP[화면에서 읽은 글자 유지]
+
+    PARA --> MERGE[시간순 병합]
+    REP --> MERGE
+    KEEP --> MERGE
+    MERGE --> MD[Markdown<br/>머리말 · 화면 차례 · ⚠ · 📺]
+```
 
 ## 산출물
 
@@ -89,6 +142,9 @@ Tesseract에 `kor+eng`를 함께 주면 **굵은 한글이 영어 낱말로 오�
 | 6-2 | 10/14 (71%) | 28 → 38 |
 | 6-3 | 11/13 (85%) | 39 → 49 |
 
+교시마다 되풀이되는 학습목표 쪽이 1교시 것으로 잘못 붙던 문제는, **강의는 앞에서 뒤로
+진행한다**는 사실을 가중치로 넣어 해결했다.
+
 ### 3. 빠른 경로가 조용히 품질을 깎고 있었다
 
 `BatchedInferencePipeline`은 `without_timestamps=True`가 기본이라 타임스탬프가
@@ -132,7 +188,7 @@ Ryzen AI 5 435 (6C/12T), RAM 16GB, 내장 GPU (CUDA 불가 → CPU int8)
 쪽번호·표식·마커 왕복을 확인하므로, 형식이 깨지는 회귀를 몇 시간짜리 전사 없이 잡는다.
 
 ```bash
-python engine/문단화_검증.py
+engine\venv\Scripts\python engine\문단화_검증.py
 ```
 
 ## 찾아 고친 결함들
@@ -146,7 +202,8 @@ python engine/문단화_검증.py
 | Tesseract 실패가 "글자 없음"으로 위장 | 슬라이드 0장인 MD가 정상처럼 저장 | 반환코드 미검사 → 예외로 승격 |
 | 흰 배경 텍스트 슬라이드 누락 | 44분 강의에서 **37분이 통째로 빠짐** | 장면 임계값이 너무 높음. 진단은 "슬라이드 공백"이 아니라 **타임스탬프가 안전 간격의 배수인 비율**로 해야 드러난다(53% vs 정상 1~3%) |
 | 단위 테스트가 이름과 다른 것을 검증 | "문장 중간 절단 없음"이 실제로는 문단 길이만 확인 | 계산한 변수를 단정에 쓰지 않음 |
-| `SetPriorityClass`가 완전 무동작 | 우선순위가 바뀌지 않음 | ctypes `restype` 미선언으로 64비트 핸들이 잘림 → 노트북에 해로우므로 제거 |
+| 무인 실행이 조용히 멈춤 | 배터리로 돌리면 중간에 절전 | 절전 타이머는 CPU 부하가 아니라 **사용자 입력 유휴**를 본다 → `PowerSetRequest`로 차단 |
+| 임시 파일 수백 MB가 폴더 밖에 잔류 | `%TEMP%`에 384MB 누적 | 강제 종료 시 정리 코드가 안 돎 → 작업 폴더를 도구 안(`.tmp/`)으로 옮기고 다음 실행이 회수 |
 
 **교훈:** 속도만 재고 산출물 품질을 한 번도 세어보지 않은 것이 근본 실패였다.
 "잘 되는 것 같다"는 인상으로 종결하지 말고 **산출물을 열어 세어볼 것.**
@@ -160,38 +217,52 @@ python engine/문단화_검증.py
 - **PDF 없이 OCR만 있을 때** — `장업단계`(창업), `벤저캐피탈`(벤처)처럼 **형태는 멀쩡한데
   글자가 틀린** 것은 기준 원본 없이 구별할 방법이 없다.
 
-## 설치와 실행
+## 설치
 
-**필요한 것**
+**미리 있어야 하는 것**
 
-- Python 3.11 이상 · [ffmpeg](https://ffmpeg.org/) · [Tesseract OCR](https://github.com/tesseract-ocr/tesseract)
-- 언어 데이터 `eng.traineddata`, `kor.traineddata` → `engine/tessdata/`
-  (`configs`, `tessconfigs` 폴더도 함께 두어야 한다. 없으면 `tsv`가 설정 파일로 해석된다)
+| | 확인 |
+|---|---|
+| Windows 10/11 | |
+| [Python 3.11+](https://www.python.org/downloads/) | 설치 시 **"Add python.exe to PATH"** 체크 |
+| [ffmpeg](https://ffmpeg.org/download.html) | `winget install Gyan.FFmpeg` |
+| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) | 슬라이드를 읽지 않을 거면 생략 가능 |
 
-```bash
-python -m venv engine/venv
-engine/venv/Scripts/pip install faster-whisper pypdf
+**설치**
+
+`환경 설치.bat` 더블클릭. 한 번만 하면 된다.
+
+- 폴더 안에 가상환경을 만들고 `engine/requirements.txt`를 잠긴 버전으로 설치한다
+- 슬라이드 OCR 언어 데이터(`kor`·`eng`, 16MB)를 릴리스에서 받아 `engine/tessdata/`에 푼다
+- 끝에 무엇이 준비됐고 무엇이 빠졌는지 점검해 알려 준다
+
+음성 인식 모델(1.6GB)은 **첫 실행 때 자동으로** 내려받는다.
+
+**실행**
+
 ```
-
-**쓰기**
-
-```
-MP4 입력/          ← 강의 영상
+MP4 입력/          ← 강의 영상을 넣는다 (하위 폴더 가능)
 강의자료 PDF/       ← 강의노트 PDF (선택, 권장)
 ```
 
-`Transcriber 실행.bat` 실행 → `MD 출력/`에 결과.
-설정은 `설정.ini`, 자세한 사용법은 [사용법.md](사용법.md),
+`Transcriber 실행.bat` 더블클릭 → `MD 출력/`에 결과.
+설정은 [`설정.ini`](설정.ini), 자세한 사용법은 [사용법.md](사용법.md),
 결과물을 LLM에 넣을 때의 안내는 [CLAUDE.md](CLAUDE.md).
 
 ## 구조
 
 ```
-engine/transcribe.py     엔진 전체 (설정·전사·OCR·PDF 정합·출력)
-engine/문단화_검증.py      단위 검증 59개
-설정.ini                 사용자 설정
 Transcriber 실행.bat      실행 진입점
+환경 설치.bat             최초 1회 설치
+설정.ini                  사용자 설정
+engine/transcribe.py      엔진 전체 (설정·전사·OCR·PDF 정합·출력)  ~1,490줄
+engine/문단화_검증.py       단위 검증 59개
+engine/setup_env.py       가상환경 생성 · 의존성 · 언어 데이터 · 점검
+engine/requirements.txt   버전 잠금
 ```
+
+**폴더 밖을 더럽히지 않는다.** 가상환경·모델·언어 데이터·임시 파일이 전부 도구 폴더 안에
+생기므로, 폴더를 통째로 지우면 흔적이 남지 않는다.
 
 산출물 끝에는 `<!-- transcriber: {...} -->` 마커가 붙는다. 다시 변환할지는 파일 날짜가
 아니라 이 마커로 판정하므로, **설정·강의자료·엔진이 바뀌면 자동으로 다시 만들고
