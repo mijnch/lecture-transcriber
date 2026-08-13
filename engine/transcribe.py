@@ -38,6 +38,24 @@ TESSDATA_DIR = ENGINE_DIR / "tessdata"
 CONFIG_FILE = BASE / "설정.ini"
 LOG_FILE = BASE / "실행기록.txt"
 
+# 작업용 임시 폴더도 이 폴더 안에 둔다 — 기본값(%TEMP%)을 쓰면 전사 중 WAV·프레임
+# 이미지가 수백 MB씩 폴더 밖에 생기고, 강제 종료되면 그대로 남는다.
+# 여기 두면 흔적이 도구 폴더 안에서만 생기고 cleanup_stale_temp() 가 회수한다.
+TMP_ROOT = BASE / ".tmp"
+
+
+def tmp_root():
+    """임시 폴더의 부모를 돌려준다(없으면 만든다).
+
+    쓰기가 막힌 위치(읽기 전용 매체 등)에 도구가 놓였을 때까지 실패시키지는
+    않는다 — 그 경우에만 None 을 돌려 tempfile 기본값(%TEMP%)으로 물러선다.
+    """
+    try:
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        return TMP_ROOT
+    except OSError:
+        return None
+
 MEDIA_EXTS = {".mp4", ".m4a", ".mp3", ".wav", ".mkv", ".mov", ".webm",
               ".avi", ".flac", ".ogg", ".aac", ".wma", ".mpeg", ".mpg", ".mts", ".wmv",
               ".m4v", ".ts", ".opus", ".3gp", ".amr", ".mp2"}
@@ -371,7 +389,7 @@ def ocr_lines(tess: str, img: Path, langs: str):
     글자는 txt에서 가져온다 — 한글은 Tesseract가 음절 단위로 끊어 좌표만으로는
     띄어쓰기를 되살리기 어렵지만, txt 출력에는 이미 제대로 반영되어 있다.
     """
-    with tempfile.TemporaryDirectory(prefix="ocr_") as td:
+    with tempfile.TemporaryDirectory(prefix="ocr_", dir=tmp_root()) as td:
         base = Path(td) / "page"
         r = subprocess.run([tess, str(img), str(base), "-l", langs, "--psm", "6",
                             "tsv", "txt"],
@@ -1180,15 +1198,20 @@ def cleanup_stale_temp():
     """지난 실행이 강제 종료되며 남긴 임시 파일을 치운다.
 
     창을 X로 닫으면 파이썬의 정리 코드가 돌지 못해 WAV·프레임 이미지가 수백 MB씩
-    %TEMP%에 남는다. 강제 종료 자체는 막을 수 없으므로 다음 실행이 청소한다.
+    남는다. 강제 종료 자체는 막을 수 없으므로 다음 실행이 청소한다.
+
+    ★ 두 곳을 훑는다: 현재 위치(TMP_ROOT, 도구 폴더 안)와 예전 위치(%TEMP%).
+    임시 폴더를 도구 안으로 옮기기 전에 %TEMP% 에 남은 잔재도 한 번은 회수해야
+    영영 남지 않는다. tmp_root()가 폴백해 %TEMP% 를 쓰는 경우에도 이쪽이 맞다.
     """
     freed = 0
     cutoff = time.time() - 6 * 3600
-    root = Path(tempfile.gettempdir())
-    try:
-        stale = [d for d in root.glob("transcriber_*") if d.is_dir()]
-    except OSError:
-        stale = []
+    stale = []
+    for root in (TMP_ROOT, Path(tempfile.gettempdir())):
+        try:
+            stale += [d for d in root.glob("transcriber_*") if d.is_dir()]
+        except OSError:
+            pass
     for d in stale:
         try:
             if d.stat().st_mtime > cutoff:
@@ -1249,6 +1272,86 @@ def check_ocr_langs(tess: str, options):
         return (f"언어 데이터가 없습니다: {', '.join(missing)} "
                 f"(가진 것: {', '.join(sorted(have)) or '없음'})")
     return None
+
+
+_sleep_block = None   # (handle, reason_context) — 살려 둬야 사유 문자열이 유효하다
+
+
+def prevent_sleep(enable):
+    """전사 중에는 시스템이 절전으로 들어가지 못하게 막는다.
+
+    AC 전원의 절전 대기가 60분으로 켜져 있는데, Windows의 절전 타이머는
+    CPU 부하가 아니라 사용자 입력 유휴를 본다. 즉 몇 시간짜리 무인 전사도
+    키보드를 안 건드리면 그냥 잠들어 버린다.
+
+    화면은 일부러 막지 않는다(PowerRequestSystemRequired만 건다) —
+    패널은 꺼지고 전사는 계속된다.
+
+    SetThreadExecutionState가 아니라 PowerSetRequest를 쓰는 이유는
+    `powercfg /requests`의 SYSTEM 칸에 아래 사유 문자열까지 찍혀서
+    나중에 "무엇이 이 기계를 깨워 두는가"를 감사할 수 있기 때문이다.
+    레거시 API는 그 목록에 아예 나타나지 않아 검증이 불가능하다.
+
+    실패해도 전사 자체에는 영향이 없으므로 조용히 넘어간다.
+    """
+    global _sleep_block
+    if os.name != "nt":
+        return
+
+    POWER_REQUEST_CONTEXT_SIMPLE_STRING = 0x00000001
+    # POWER_REQUEST_TYPE: 0=Display 1=System 2=AwayMode 3=Execution
+    PowerRequestSystemRequired = 1
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        if enable:
+            if _sleep_block is not None:
+                return
+
+            class _Detailed(ctypes.Structure):
+                _fields_ = [("LocalizedReasonModule", wintypes.HMODULE),
+                            ("LocalizedReasonId", wintypes.ULONG),
+                            ("ReasonStringCount", wintypes.ULONG),
+                            ("ReasonStrings", ctypes.POINTER(wintypes.LPWSTR))]
+
+            class _Reason(ctypes.Union):
+                _fields_ = [("Detailed", _Detailed),
+                            ("SimpleReasonString", wintypes.LPWSTR)]
+
+            class _ReasonContext(ctypes.Structure):
+                _fields_ = [("Version", wintypes.ULONG),
+                            ("Flags", wintypes.DWORD),
+                            ("Reason", _Reason)]
+
+            k32.PowerCreateRequest.argtypes = [ctypes.POINTER(_ReasonContext)]
+            k32.PowerCreateRequest.restype = wintypes.HANDLE
+            k32.PowerSetRequest.argtypes = [wintypes.HANDLE, ctypes.c_int]
+            k32.PowerSetRequest.restype = wintypes.BOOL
+
+            ctx = _ReasonContext()
+            ctx.Version = 0
+            ctx.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING
+            ctx.Reason.SimpleReasonString = "Transcriber: transcription in progress"
+
+            h = k32.PowerCreateRequest(ctypes.byref(ctx))
+            if h and h != -1 and k32.PowerSetRequest(h, PowerRequestSystemRequired):
+                _sleep_block = (h, ctx)
+                return
+            # 최신 API가 안 되면 레거시로 물러선다(감사는 안 되지만 동작은 한다)
+            k32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        else:
+            if _sleep_block is not None:
+                h = _sleep_block[0]
+                k32.PowerClearRequest(h, PowerRequestSystemRequired)
+                k32.CloseHandle(h)
+                _sleep_block = None
+            else:
+                k32.SetThreadExecutionState(0x80000000)
+    except Exception:
+        pass
 
 
 def main():
@@ -1345,7 +1448,7 @@ def main():
 
     ok, failures = 0, []
     try:
-        with tempfile.TemporaryDirectory(prefix="transcriber_",
+        with tempfile.TemporaryDirectory(prefix="transcriber_", dir=tmp_root(),
                                          ignore_cleanup_errors=True) as td:
             for i, (src, out_path) in enumerate(targets, 1):
                 try:
@@ -1377,9 +1480,12 @@ def main():
 
 
 if __name__ == "__main__":
+    prevent_sleep(True)
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         print("\n\n중단했습니다. 완료된 파일은 저장되어 있고, "
               "진행 중이던 파일은 다음 실행에서 처음부터 다시 합니다.")
         sys.exit(1)
+    finally:
+        prevent_sleep(False)

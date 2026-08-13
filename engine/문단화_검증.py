@@ -249,9 +249,9 @@ print("\n산출물 생성")
 
 import tempfile, types
 from pathlib import Path
-from transcribe import write_markdown, read_marker
+from transcribe import write_markdown, read_marker, tmp_root
 
-with tempfile.TemporaryDirectory(prefix="mdcheck_") as td:
+with tempfile.TemporaryDirectory(prefix="mdcheck_", dir=tmp_root()) as td:
     out = Path(td) / "창업과실용법률 12-1강.md"
     src = Path(td) / "창업과실용법률 12-1강.mp4"
     src.write_bytes(b"x" * 100)
