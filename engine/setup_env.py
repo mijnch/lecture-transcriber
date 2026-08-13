@@ -7,7 +7,8 @@
   1. 쓸 만한 Python 3.14 를 찾는다
   2. engine\\venv 를 만든다  (폴더 안이므로 도구를 옮기면 같이 간다)
   3. engine\\requirements.txt 로 패키지를 설치한다
-  4. 핵심 import 와 외부 프로그램(FFmpeg·Tesseract) 을 검증한다
+  4. 슬라이드 OCR용 언어 데이터(16MB)를 릴리스에서 받는다
+  5. 핵심 import 와 외부 프로그램(FFmpeg·Tesseract) 을 검증한다
 
 왜 필요한가
   venv 는 이식되지 않는다 — pyvenv.cfg 의 `home =` 에 만들어진 PC의 파이썬
@@ -37,6 +38,10 @@ REQ = ENGINE_DIR / "requirements.txt"
 VENV_PY = VENV_DIR / "Scripts" / "python.exe"
 
 REQUIRED_IMPORTS = ["faster_whisper", "ctranslate2", "av", "numpy", "pypdf", "onnxruntime"]
+
+# 슬라이드 OCR용 언어 데이터(16MB). 저장소가 아니라 릴리스 자산으로 둔다.
+TESSDATA_URL = ("https://github.com/mijnch/lecture-transcriber/releases/"
+                "download/assets-v1/transcriber-tessdata.zip")
 
 
 def say(msg: str) -> None:
@@ -97,18 +102,57 @@ def main() -> int:
         return 1
     say(f" 바탕 파이썬: {base}")
 
-    say("\n[1/3] 가상환경 생성")
+    say("\n[1/4] 가상환경 생성")
     if not run([base, "-m", "venv", str(VENV_DIR)], f"venv → {VENV_DIR}"):
         return 1
 
-    say("\n[2/3] 패키지 설치 (수 분 걸립니다)")
+    say("\n[2/4] 패키지 설치 (수 분 걸립니다)")
     run([str(VENV_PY), "-m", "pip", "install", "--upgrade", "pip", "-q"], "pip 갱신")
     if not run([str(VENV_PY), "-m", "pip", "install", "-r", str(REQ)], "requirements.txt 설치"):
         say("    설치에 실패했습니다. 위의 오류를 확인하세요.")
         return 1
 
-    say("\n[3/3] 검증")
+    fetch_tessdata()
+
+    say("\n[4/4] 검증")
     return verify()
+
+
+def fetch_tessdata() -> bool:
+    """슬라이드 OCR용 언어 데이터를 받아 온다.
+
+    ★ 왜 시스템 Tesseract 로 충분하지 않은가
+      Tesseract 를 설치해도 한국어는 대개 함께 깔리지 않는다 — 기본 설치는
+      eng·osd 뿐이다(이 PC의 시스템 설치본도 그렇다). 그리고 transcribe.py 의
+      ocr_lang_options() 는 **폴더 안** kor.traineddata 유무로 한국어를 읽을지
+      정하므로, 이것이 없으면 한국어 슬라이드가 오류 없이 조용히 안 읽힌다.
+
+      실패해도 설치 자체는 진행한다 — 전사는 이것 없이도 정상 동작하고,
+      영향은 '한국어 슬라이드를 못 읽는다' 로 국한된다.
+    """
+    import urllib.request
+    import zipfile
+
+    dest = ENGINE_DIR / "tessdata"
+    if (dest / "kor.traineddata").is_file():
+        say("\n[3/4] 슬라이드 OCR 언어 데이터: 이미 있습니다 — 건너뜁니다")
+        return True
+
+    say("\n[3/4] 슬라이드 OCR 언어 데이터 내려받기 (7MB)")
+    zpath = ENGINE_DIR / "_tessdata.zip"
+    try:
+        urllib.request.urlretrieve(TESSDATA_URL, zpath)
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(ENGINE_DIR)
+        zpath.unlink(missing_ok=True)
+        say(f"    완료 → {dest}")
+        return True
+    except Exception as e:
+        zpath.unlink(missing_ok=True)
+        say(f"    [실패] {type(e).__name__}: {e}")
+        say("    전사는 정상 동작합니다. 한국어 슬라이드만 읽지 못합니다.")
+        say(f"    직접 받으려면: {TESSDATA_URL}")
+        return False
 
 
 def verify() -> int:
@@ -133,6 +177,15 @@ def verify() -> int:
         say(f"  OK   Tesseract: {tess}")
     else:
         say(f"  ★    Tesseract 없음 — 슬라이드 글자 읽기 기능만 꺼집니다")
+
+    # 한국어 슬라이드는 이것이 없으면 오류 없이 조용히 안 읽힌다 —
+    # 시스템 Tesseract 는 보통 eng·osd 만 갖고 있다. 그래서 따로 확인한다.
+    kor = ENGINE_DIR / "tessdata" / "kor.traineddata"
+    if kor.is_file():
+        say(f"  OK   한국어 슬라이드 읽기: 준비됨")
+    else:
+        say(f"  ★    한국어 언어 데이터 없음 — 한국어 슬라이드를 읽지 못합니다")
+        say(f"       (영어 슬라이드와 음성 전사는 정상입니다)")
 
     models = ENGINE_DIR / "models"
     n = len(list(models.glob("*"))) if models.is_dir() else 0
