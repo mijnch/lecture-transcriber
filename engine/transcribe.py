@@ -849,6 +849,51 @@ def read_marker(md: Path, src_name: str):
     return legacy
 
 
+_STAGED: list = []      # 끌어다 놓기로 우리가 만든 이름들 (종료 시 반드시 지운다)
+
+
+def stage_dropped(paths):
+    """바로가기에 끌어다 놓은 파일을 "MP4 입력" 에 잠시 걸어 둔다.
+
+    plan_targets 가 relative_to(IN_DIR) 로 문서 이름을 만들기 때문에 임의 경로를
+    그대로 넘길 수 없다. 그래서 입력 폴더 안에 이름을 하나 만들어 준다.
+
+    하드링크를 먼저 쓴다 — 강의 영상은 수 GB라 복사하면 느리고 공간도 그만큼 든다.
+    하드링크는 같은 파일에 이름을 하나 더 다는 것뿐이라 즉시 끝나고, 나중에 그 이름을
+    지워도 원본은 남는다. 다른 볼륨이면 하드링크가 안 되므로 복사로 물러선다.
+    """
+    staged = _STAGED       # 모듈 전역 — 어느 경로로 끝나든 __main__ 이 치울 수 있게 한다
+    for p in paths:
+        if p.suffix.lower() not in MEDIA_EXTS:
+            print(f"  건너뜀: {p.name} (지원하지 않는 형식)")
+            continue
+        if not p.is_file():
+            print(f"  건너뜀: {p.name} (파일을 찾을 수 없습니다)")
+            continue
+        dest = IN_DIR / p.name
+        if dest.exists():                      # 이미 입력 폴더에 있는 파일이면 그대로 둔다
+            continue
+        try:
+            os.link(p, dest)                   # 같은 볼륨: 즉시
+        except OSError:
+            try:
+                shutil.copy2(p, dest)          # 다른 볼륨: 복사
+            except OSError as e:
+                print(f"  건너뜀: {p.name} ({e})")
+                continue
+        staged.append(dest)
+    return staged
+
+
+def unstage(staged):
+    """우리가 만든 이름만 지운다. 원본 파일과 원래 입력 폴더 내용은 건드리지 않는다."""
+    for p in staged:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def plan_targets(cfg):
     """무엇을 전사할지 결정한다. 파일시스템을 변형하지 않는다."""
     files, ignored = [], []
@@ -1370,6 +1415,11 @@ def main():
         d.mkdir(exist_ok=True)
     cleanup_stale_temp()
 
+    # 바로가기에 영상을 끌어다 놓으면 입력 폴더를 찾아 들어가지 않아도 된다.
+    staged = stage_dropped([Path(a) for a in sys.argv[1:]]) if sys.argv[1:] else []
+    if staged:
+        print(f"\n끌어다 놓은 {len(staged)}개를 처리합니다.")
+
     cfg = load_config()
     try:
         targets, skipped, blocked, ignored, rebuilt = plan_targets(cfg)
@@ -1476,6 +1526,14 @@ def main():
             print(f"  ✘ {name}\n      {err}")
         print(f"\n기록은 {LOG_FILE.name}에 남아 있습니다.")
     print(f"결과 위치: {OUT_DIR}")
+
+    # 결과를 보러 폴더를 찾아 들어가지 않아도 되도록 열어 준다.
+    if ok:
+        try:
+            os.startfile(OUT_DIR)
+        except Exception:
+            pass
+
     return 0 if not failures else 1
 
 
@@ -1488,4 +1546,5 @@ if __name__ == "__main__":
               "진행 중이던 파일은 다음 실행에서 처음부터 다시 합니다.")
         sys.exit(1)
     finally:
+        unstage(_STAGED)      # 끌어다 놓기로 만든 이름은 어떤 경우에도 남기지 않는다
         prevent_sleep(False)

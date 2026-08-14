@@ -31,7 +31,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%PY%" "%~dp0engine\transcribe.py"
+"%PY%" "%~dp0engine\transcribe.py" %*
 set RC=%ERRORLEVEL%
 
 echo.
