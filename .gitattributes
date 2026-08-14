@@ -1,0 +1,21 @@
+# 배치 파일은 반드시 CRLF 로 체크아웃되어야 한다.
+# LF 로 풀리면 cmd 가 파일을 바이트 오프셋으로 되짚다가 한글(멀티바이트) 중간에서
+# 재개해 스크립트가 깨진다 - 'rem' 이 'em' 으로, 'goto' 가 'to' 로 읽힌다(실측).
+# clone 하는 PC 의 core.autocrlf 설정에 기대지 않는다.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 파이썬·문서는 LF 로 통일한다.
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+
+# 바이너리는 건드리지 않는다.
+*.ico binary
+*.icm binary
+*.onnx binary
+*.traineddata binary
+*.pdf binary
+*.png binary
+*.zip binary
