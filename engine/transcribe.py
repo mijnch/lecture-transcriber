@@ -1400,6 +1400,7 @@ def prevent_sleep(enable):
 
 
 def main():
+    started = time.monotonic()
     print("=" * 58)
     print(" Transcriber — 영상·음성을 Markdown 전사문으로")
     print("=" * 58)
@@ -1531,6 +1532,15 @@ def main():
     if ok:
         try:
             os.startfile(OUT_DIR)
+        except Exception:
+            pass
+
+    # 강의 하나가 20분 넘게 걸린다 — 자리를 비웠어도 끝났음을 알 수 있게 소리로 알린다.
+    # 짧은 파일까지 울리면 성가시므로 1분을 넘긴 경우만.
+    if time.monotonic() - started > 60:
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
         except Exception:
             pass
 
