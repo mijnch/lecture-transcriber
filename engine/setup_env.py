@@ -169,11 +169,17 @@ def verify() -> int:
 
     say("")
     # 외부 프로그램 — 폴더 밖 의존물이라 여기서 만들어 줄 수 없다
-    ff = shutil.which("ffmpeg")
-    say(f"  {'OK ' if ff else '★  '} FFmpeg: {ff or '없음 — 원본 직접 디코딩으로 폴백(느림)'}")
+    ff, fp = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    say(f"  {'OK ' if ff else '★  '} FFmpeg: {ff or '없음 — 원본 직접 디코딩으로 폴백(느림), 슬라이드 읽기 불가'}")
+    if ff and not fp:
+        say("  ★    ffprobe 없음 — 파일 손상 검사와 슬라이드 읽기를 건너뜁니다")
 
-    tess = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-    if tess.is_file():
+    # 엔진과 같은 방법으로 찾는다 (PATH → Program Files). 예전에는 여기만 고정 경로를
+    # 봐서, PATH 에 있는 Tesseract 를 두고 '없음'이라고 알렸다.
+    sys.path.insert(0, str(ENGINE_DIR))
+    from transcribe import find_tesseract
+    tess = find_tesseract()
+    if tess:
         say(f"  OK   Tesseract: {tess}")
     else:
         say(f"  ★    Tesseract 없음 — 슬라이드 글자 읽기 기능만 꺼집니다")

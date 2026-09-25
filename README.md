@@ -10,9 +10,9 @@
 |---|---|
 | **입력 → 출력** | MP4(+강의노트 PDF) → 타임스탬프 Markdown |
 | **동작 방식** | 전부 로컬 (faster-whisper · Tesseract · ffmpeg). 업로드 없음, 용량 제한 없음 |
-| **처리 속도** | 1시간 영상당 27~43분 (슬라이드 읽기 포함) |
-| **실적** | 9개 강의 318분 무인 처리, 실패 0 · 한글 슬라이드 3,160줄 중 **파손 0줄** |
-| **검증** | 단위 검증 59개, 1초 내 완료 (산출물 생성 포함) |
+| **슬라이드 포착** | 합성 강의 48장 중 **48장, 실제 전환 시각 ±1초** (이전 판 39장, 최대 20초 지연) |
+| **검증** | 단위 검증 87개(1초) + 정답을 아는 합성 강의로 끝까지 돌려 채점하는 종단 검증 |
+| **실적** | 이전 판으로 실강의 9개 318분 무인 처리, 한글 슬라이드 3,160줄 중 **파손 0줄** |
 | **설치** | `환경 설치.bat` 더블클릭 |
 
 <details>
@@ -21,22 +21,25 @@
 A local pipeline that turns recorded university lectures into **LLM-readable Markdown**.
 
 Plain speech-to-text loses two things: everything that was *on the screen*, and any signal about
-which sentences can be trusted. ASR occasionally produces **fluent nonsense** that neither a human
-nor an LLM can detect — quote it and you have invented a fact.
+which sentences can be trusted. ASR occasionally produces **fluent nonsense** — or silently drops
+a passage spoken in another language — and neither a human nor an LLM can tell from the text.
 
 So this tool interleaves three channels in one document:
 
-- **speech** — sequential faster-whisper decoding with quality gates and precise timestamps
-- **screen** — scene-change detection → OCR, with per-line language selection
-- **ground truth** — when the original lecture-note PDF is available, OCR is used only as a
-  *key to identify which page is on screen*, and the body text is replaced with the PDF original
+- **speech** — sequential faster-whisper decoding with quality gates and word timestamps; spans
+  where the VAD hears speech but no words came out are re-transcribed with fresh language detection
+- **screen** — slide changes found by *changed-pixel ratio* against the last kept frame, with
+  constantly moving regions (speaker cam, embedded video) learned and masked out; parallel OCR
+  with per-line language selection
+- **ground truth** — when the lecture-note PDF is available, OCR is used only as a *key to find
+  which page is on screen*, and the body text is replaced with the PDF original
 
-Every paragraph that the decoder was unsure about is marked `⚠`. Text that came from a video
-played *during* the lecture — not from the professor — is marked `📺`. Slides backed by the PDF
-carry a page number.
+Paragraphs break where the slide changes, so each explanation sits under the slide it refers to.
+Unsure paragraphs are marked `⚠`; audio from a video played *during* the lecture is marked `📺`.
 
-Runs fully offline on a laptop CPU (no CUDA required). Windows-first; Korean UI.
-Every design decision below was settled by measurement, not preference.
+Runs fully offline on a laptop CPU (no CUDA). Windows-first; Korean UI.
+Every design decision below was settled by measurement, and an end-to-end test builds a synthetic
+lecture with known answers (rendered slides, TTS narration, a played video clip) and grades the output.
 
 </details>
 
@@ -46,30 +49,32 @@ Every design decision below was settled by measurement, not preference.
 
 ```mermaid
 flowchart TD
-    MP4[MP4 강의 영상] --> A[ffmpeg<br/>오디오 추출]
-    MP4 --> S[ffmpeg<br/>장면 전환 검출]
-    PDF[(강의노트 PDF<br/>선택)] --> H[전문용어 추출]
-    PDF --> P[쪽별 원문]
+    MP4[MP4 강의 영상] --> A[ffmpeg 오디오 추출]
+    MP4 --> S[1초마다 축소 화면<br/>바뀐 화소 비율 · 움직이는 칸 제외]
+    PDF[(강의노트 PDF<br/>선택)] --> H[전문용어 목록]
+    PDF --> P[쪽별 원문<br/>되풀이되는 배너 제거]
 
     H -.hotwords.-> W
-    A --> W[faster-whisper 순차 전사<br/>품질 게이트 · 온도 폴백]
-    W --> Q{구간별 신뢰도<br/>avg_logprob · 반복}
-    Q --> PARA[문단<br/>문장 중간에서 끊지 않음]
+    A --> W[faster-whisper 순차 전사<br/>품질 게이트 · 낱말 시각]
+    W --> G{말소리는 있는데<br/>낱말이 없는 구간?}
+    G -->|있음| R[그 구간만 언어를 새로 정해<br/>다시 읽기]
+    G --> PH[구절]
+    R --> PH
 
     S --> F[전환 프레임]
-    F --> O[Tesseract 2패스<br/>kor·eng 따로]
-    O --> L[줄 높이로 맞대어<br/>줄마다 확신도로 선택]
-    L --> M[유사 슬라이드 병합]
-
+    F --> O[Tesseract 병렬 · kor/eng 따로<br/>줄마다 확신도로 선택]
+    O --> M[유사 슬라이드 병합]
     M --> AL{2연쇄 대조로<br/>PDF 쪽 찾기}
     P --> AL
-    AL -->|찾음| REP[본문을 PDF 원문으로 교체<br/>+ 쪽번호]
-    AL -->|못 찾음| KEEP[화면에서 읽은 글자 유지]
+    AL -->|찾음| REP[PDF 원문 + 쪽번호]
+    AL -->|못 찾음| KEEP[화면에서 읽은 글자]
+    REP --> LB[슬라이드 / 재생 영상 구분<br/>화면이 움직이는가 + 발화와 겹치는가]
+    KEEP --> LB
 
-    PARA --> MERGE[시간순 병합]
-    REP --> MERGE
-    KEEP --> MERGE
-    MERGE --> MD[Markdown<br/>머리말 · 화면 차례 · ⚠ · 📺]
+    PH --> PARA[문단<br/>슬라이드가 바뀌면 끊음]
+    LB --> PARA
+    PARA --> MD[Markdown<br/>머리말 · 화면 차례 · ⚠ · 📺]
+    LB --> MD
 ```
 
 ## 산출물
@@ -97,6 +102,8 @@ flowchart TD
 
 **[00:31:07]** ⚠ 인식이 흔들린 문단입니다. 원문과 다를 수 있습니다.
 
+> **📺 영상 자막 [00:38:20 – 00:39:05]**
+
 **[00:38:22]** 📺 (교수의 말이 아니라 강의 중 재생된 영상의 말소리)
 ````
 
@@ -105,7 +112,7 @@ flowchart TD
 | `🖵 슬라이드 N쪽` | 강의자료 PDF **원문 그대로**. 가장 믿을 수 있다 |
 | `🖵 슬라이드` | 화면을 OCR로 읽은 것 |
 | `📺` | 교수의 말이 **아니라** 재생된 영상 |
-| `⚠` | 음성 인식이 흔들린 구간 |
+| `⚠` | 음성 인식이 흔들린 구간, 또는 말소리가 있었지만 옮기지 못한 구간 |
 
 ## 설계에서 중요했던 판단
 
@@ -128,24 +135,33 @@ Tesseract에 `kor+eng`를 함께 주면 **굵은 한글이 영어 낱말로 오�
 ### 2. OCR을 "내용"이 아니라 "정합 열쇠"로 쓴다
 
 강의자료 PDF가 있으면, 화면에서 읽은 글자는 **"지금 몇 쪽인가"를 알아내는 데만** 쓰고
-본문은 PDF 원문으로 갈아끼운다. 잡음이 0이 되고 표의 열 구분과 빈칸이 보존된다.
+본문은 PDF 원문으로 갈아끼운다. 잡음이 0이 되고, OCR이 제목만 겨우 읽는 표 슬라이드도
+표의 행까지 원문으로 실린다.
 
 대조는 낱말이 아니라 **글자 2연쇄(bigram)** 로 한다. 한국어 조사 변화(`표본` vs
 `표본의`)와 OCR 잡음에 낱말 집합은 너무 약해서, 실측에서 임계 0.30에도 0.25밖에
-나오지 않았다. 2연쇄로 바꾸니 깨진 OCR로도 정확히 맞춘다.
+나오지 않았다. 2연쇄로 바꾸니 깨진 OCR로도 정확히 맞춘다. 실강의 3편에서 **쪽 순서가
+완벽하게 단조 진행**했다(90% / 71% / 85% 확정, 교시별 시작 쪽까지 정확).
 
-실측 정합률 — 3개 강의에서 **쪽 순서가 완벽하게 단조 진행**했다(교시별 시작 쪽까지 정확).
+### 3. 화면 전환은 "평균 차이"가 아니라 "바뀐 화소의 비율"로 찾는다
 
-| 강의 | 확정률 | 쪽 순서 |
+ffmpeg의 `scene` 점수는 화면 전체의 평균 차이라서, 흰 바탕에 글자만 바뀌는 전환은
+임계 0.03으로도 못 잡는다. 합성 강의에서 **전환 8번 중 1번만** 잡혔고, 나머지는 30초 안전
+샘플에 걸려 최대 20초 늦게 찍혔으며 **짧게 지나간 슬라이드 2장은 통째로 빠졌다.**
+
+| 척도 (320×240 회색, 밝기 차 >24) | 글자 한 줄이 늘어난 전환 | 정지 화면 |
 |---|---|---|
-| 6-1 | 26/29 (90%) | 1 → 27 |
-| 6-2 | 10/14 (71%) | 28 → 38 |
-| 6-3 | 11/13 (85%) | 39 → 49 |
+| 바뀐 화소 비율 | **0.45%** | **0.000%** |
 
-교시마다 되풀이되는 학습목표 쪽이 1교시 것으로 잘못 붙던 문제는, **강의는 앞에서 뒤로
-진행한다**는 사실을 가중치로 넣어 해결했다.
+그래서 1초마다 축소 화면을 받아 **마지막으로 고른 화면과** 견준다(조금씩 쌓이는 판서도 잡힌다).
+화자 창·화면 속 동영상처럼 **계속 움직이는 칸은 스스로 알아내 비교에서 뺀다.** 안전 샘플이 필요
+없어졌고, 16.6분 합성 강의에서 슬라이드 48장을 전부 ±1초로 잡았다(이전 판 39장).
 
-### 3. 빠른 경로가 조용히 품질을 깎고 있었다
+화면을 고른 패스와 읽는 패스가 같은 프레임을 가리켜야 한다 — `fps=1`의 기본 반올림은
+n+0.5초 근처 프레임을 줘서, 전환을 잡고도 **전환 직전 화면을 읽어 슬라이드가 한 장씩 밀렸다.**
+`round=up`으로 바꿔 16곳 모두 화소 차이 0을 확인했다.
+
+### 4. 빠른 경로가 조용히 품질을 깎고 있었다 — 그래서 없앴다
 
 `BatchedInferencePipeline`은 `without_timestamps=True`가 기본이라 타임스탬프가
 30초 단위로 뭉개지고, 품질 게이트(`compression_ratio` / `log_prob` / `no_speech`)와
@@ -157,13 +173,26 @@ Tesseract에 `kor+eng`를 함께 주면 **굵은 한글이 영어 낱말로 오�
 | 세그먼트 간격 | 26.6초 | **5.5초** |
 | 한영 혼용 오염 | `기획의도` → `机会意度` | 없음 |
 
-**13% 느린 대가로 타임스탬프 5배 정밀 + 오염 제거** → 순차 경로 채택.
+한때 `우선순위 = 속도` 설정으로 남겨 두었으나, 전사만 15% 빠른 대가로 슬라이드와 말의
+시간 정렬을 깨는 경로라 이 도구의 목적과 맞지 않아 제거했다.
 
-### 4. 믿을 수 없는 구간을 산출물에 표시한다
+### 5. 한 언어로 읽으면 다른 언어 대목이 오류 없이 사라진다
+
+파일 전체를 `ko`로 읽으면, 한국어 강의 속 20초짜리 영어 설명이 **31초짜리 세그먼트에 한국어
+한 문장만 남기고 통째로 빠진다.** 표식도, 오류도 없다. 구간별 언어 감지(`multilingual`)로도
+복구되지 않았다(실측).
+
+그래서 낱말 시각을 켜고(비용 2.5%), VAD가 말소리라고 한 곳 가운데 **낱말이 하나도 없는
+3초 이상 구간**을 찾아 그 구간만 언어를 새로 정해 다시 읽는다. 한 번에 약 10초가 들고,
+합성 강의에서 빠진 영어 설명을 원문과 똑같이 되살렸다. 다시 읽어도 못 옮긴 긴 구간은
+본문에 `⚠`로 남긴다 — **조용한 누락을 드러난 누락으로 바꾼다.**
+
+### 6. 믿을 수 없는 구간과 다른 화자를 표시한다
 
 `avg_logprob` / `no_speech_prob` 와 반복 패턴으로 흔들린 구간을 찾아 `⚠`를 붙인다.
-화면 자막이 바로 옆 발화와 대부분 겹치면 **슬라이드가 아니라 재생된 영상**으로 보고
-`📺`로 가른다 — 그러지 않으면 영상 속 인물의 자기소개가 교수의 경력으로 읽힌다.
+화면 글자가 바로 옆 발화와 겹치고 **그때 화면이 움직이고 있으면** 재생된 영상의 자막으로 보고
+`📺`로 가른다. 움직임 조건이 없던 판은 교수가 제목 슬라이드를 소리 내 읽기만 해도 자막으로
+오판했다. 영상 구간의 끝은 다음 화면이 뜬 시각이라, 영상 직후 교수의 말은 `📺`에서 빠진다.
 
 ## 실측 성능
 
@@ -171,25 +200,35 @@ Ryzen AI 5 435 (6C/12T), RAM 16GB, 내장 GPU (CUDA 불가 → CPU int8)
 
 | 항목 | 값 |
 |---|---|
-| 처리 속도 | 1시간 영상당 **27~43분** (슬라이드 읽기 포함) |
-| 슬라이드 읽기 끔 | 1시간당 13~15분 |
-| 실적 | 9개 강의 318분 → 143분, 실패 0 |
-| 한글 슬라이드 파손 | 3,160줄 중 **0줄** |
+| OCR 병렬화 | 동시 12개로 **5.8배**, 출력은 바이트 단위로 동일 |
+| 슬라이드 처리 (16.6분 합성 강의) | 62.9초 → **32.3초**, 더 많은 전환을 잡고도 |
+| 전사 속도 | 실시간 대비 약 4~5배 |
+| 1시간 강의 전체 | 이전 판 실측 27~43분(대부분 OCR) → **약 17~24분 추정** (새 판은 실강의 미측정) |
 
-> 같은 작업을 두 번 돌려 143분과 228분이 나왔다. **동일 조건에서도 1.6배 차이**가 나므로
-> 한 번 재고 단정하지 않는 편이 좋다.
+> 같은 작업을 두 번 돌려 143분과 228분이 나온 적이 있다. **동일 조건에서도 1.6배 차이**가
+> 나므로 한 번 재고 단정하지 않는 편이 좋다. 빠진 말소리를 다시 읽는 데 한 곳당 약 10초가
+> 더 든다(다른 언어로 말한 대목이 많은 강의일수록 늘어난다).
 
 ## 검증
-
-`engine/문단화_검증.py` — 전사 없이 **1초 만에 도는 단위 검증 59개.**
-문단화·환각 표식·OCR 점수·슬라이드 병합·PDF 정합·자막 판정·산출물 지문을 다룬다.
-
-**산출물 생성 자체도 검증한다.** 가짜 입력으로 `write_markdown`을 돌려 머리말·차례·
-쪽번호·표식·마커 왕복을 확인하므로, 형식이 깨지는 회귀를 몇 시간짜리 전사 없이 잡는다.
 
 ```bash
 engine\venv\Scripts\python engine\문단화_검증.py
 ```
+
+**단위 검증 87개**, 1초 안에 끝난다. 문단화·빠진 구간 찾기·화면 전환 검출·OCR 점수·
+슬라이드 병합·PDF 정합·자막 구분·끌어다 놓기·산출물 형식을 다룬다. 가짜 입력으로
+`write_markdown`까지 돌려 머리말·차례·쪽번호·표식·마커 왕복을 확인한다. CI가 매 push마다
+Windows·Python 3.14에서 돌리고, 잠긴 의존성이 설치 가능한지도 확인한다.
+
+```bash
+engine\venv\Scripts\python engine\종단_검증.py
+```
+
+**종단 검증** — 단위 검증으로는 단계 사이의 결함을 못 잡는다. 이 스크립트는 정답을 아는
+합성 강의(Edge로 그린 슬라이드 7장, 음성 합성 나레이션, 한국어 강의 속 영어 설명, 움직이는
+화면 위 번인 자막의 재생 영상, 우측의 움직이는 화자 영역, 같은 슬라이드의 강의노트 PDF)를
+만들어 엔진을 끝까지 돌리고 **23개 항목**을 채점한다 — 모든 쪽이 순서대로 한 번씩, 전환 시각
+±1.5초, 영어 설명 보존, 재생 영상 구간 ±3초, 설명이 제 슬라이드 밑에 있는지 등. 약 80초.
 
 ## 찾아 고친 결함들
 
@@ -197,25 +236,33 @@ engine\venv\Scripts\python engine\문단화_검증.py
 
 | 결함 | 증상 | 원인 |
 |---|---|---|
-| 정상 파일이 "손상"으로 거부 | 전사 자체가 실패 | 잘림 검사가 컨테이너(=영상) 길이와 대조. 끝에 무음 화면이 붙은 녹화가 걸림 → 오디오 스트림 길이로 변경 |
-| 한 번 중단되면 그 파일이 영구 동결 | 이후 모든 실행이 "사용자가 편집함"으로 건너뜀 | 마커를 두 번 나눠 씀 + mtime 기반 판정 → 본문 SHA-256 1회 기록으로 변경 |
+| 슬라이드 누락·지연 | 전환 8번 중 1번만 검출, 2장 통째로 누락, 최대 20초 늦음 | 평균 차이(`scene`)는 글자 변화에 둔감 → 바뀐 화소 비율 + 움직이는 칸 제외 |
+| 슬라이드가 한 장씩 밀림 | 전환을 잡고도 전환 직전 화면을 읽음 | 고르는 패스(`fps` 반올림)와 읽는 패스(`-ss`)가 다른 프레임 → `round=up` |
+| 다른 언어 대목 소실 | 영어 설명 22초가 오류 없이 사라짐 | 파일 단위 언어 고정 → 낱말 없는 말소리 구간을 찾아 다시 읽기 |
+| 전문용어 힌트의 부작용 | 세그먼트 24개 → 7개, 문장부호 25개 → 5개 | PDF 문장이 그대로 프롬프트가 됨 → 쉼표로 나열한 용어 목록 |
+| 제목 슬라이드가 `📺` | 교수가 제목을 읽기만 해도 "재생된 영상" | 글자 겹침만 봄 → 화면이 움직일 때만 자막 |
+| 영상 직후 교수 말이 `📺` | "영상에서 보셨듯이…"가 교수의 말이 아니라고 표시 | 앞뒤 15초 여유 → 영상 끝을 다음 화면 시각으로 확정 |
+| 영역 판정 오류 | 화자 쪽 무늬를 글자로 읽어 슬라이드를 자르지 않음 | 읽힌 줄 수만 셈 → 깨진 줄 감점 + 오른쪽이 움직이는지 확인 |
+| 병렬화가 음성 인식을 망침 | 40초 처리에 111초, 한국어를 `en`으로 오판, "Or or or" | `OMP_THREAD_LIMIT=1`을 프로세스 전역에 걸어 CTranslate2까지 1스레드 → Tesseract에만 전달 |
+| 정상 파일이 "손상"으로 거부 | 전사 자체가 실패 | 잘림 검사가 컨테이너(=영상) 길이와 대조 → 오디오 스트림 길이로 |
+| 한 번 중단되면 그 파일이 영구 동결 | 이후 모든 실행이 "사용자가 편집함"으로 건너뜀 | 마커를 두 번 나눠 씀 + mtime 판정 → 본문 SHA-256 1회 기록 |
 | Tesseract 실패가 "글자 없음"으로 위장 | 슬라이드 0장인 MD가 정상처럼 저장 | 반환코드 미검사 → 예외로 승격 |
-| 흰 배경 텍스트 슬라이드 누락 | 44분 강의에서 **37분이 통째로 빠짐** | 장면 임계값이 너무 높음. 진단은 "슬라이드 공백"이 아니라 **타임스탬프가 안전 간격의 배수인 비율**로 해야 드러난다(53% vs 정상 1~3%) |
 | 단위 테스트가 이름과 다른 것을 검증 | "문장 중간 절단 없음"이 실제로는 문단 길이만 확인 | 계산한 변수를 단정에 쓰지 않음 |
-| 무인 실행이 조용히 멈춤 | 배터리로 돌리면 중간에 절전 | 절전 타이머는 CPU 부하가 아니라 **사용자 입력 유휴**를 본다 → `PowerSetRequest`로 차단 |
-| 임시 파일 수백 MB가 폴더 밖에 잔류 | `%TEMP%`에 384MB 누적 | 강제 종료 시 정리 코드가 안 돎 → 작업 폴더를 도구 안(`.tmp/`)으로 옮기고 다음 실행이 회수 |
+| 무인 실행이 조용히 멈춤 | 배터리로 돌리면 중간에 절전 | 절전 타이머는 **사용자 입력 유휴**를 본다 → `PowerSetRequest` |
+| 끌어다 놓은 파일 대신 다른 파일 전사 | 입력 폴더에 이름만 같은 파일이 있으면 그걸 처리 | 이름만 확인 → 같은 파일인지(`samefile`) 확인 |
 
 **교훈:** 속도만 재고 산출물 품질을 한 번도 세어보지 않은 것이 근본 실패였다.
-"잘 되는 것 같다"는 인상으로 종결하지 말고 **산출물을 열어 세어볼 것.**
-실제로 "잡음이 늘었다"고 판단했다가 전수로 세어보니 0.7%였던 적도 있다.
+"잘 되는 것 같다"는 인상으로 종결하지 말고 **산출물을 열어 세어볼 것.** 그리고 실제 자료가
+없으면 **정답을 아는 자료를 만들어** 끝까지 돌려 볼 것 — 위 표의 위쪽 여덟 줄은 전부 그렇게 찾았다.
 
 ## 한계 (원리적으로 해결되지 않는 것)
 
 - **도표의 관계** — 화살표 방향, 표의 열 구분은 글자가 아니라 남지 않는다. 낱말만 남는다.
+- **표 슬라이드의 OCR** — 테두리 선이 줄 인식을 깨서 제목만 읽힌다. PDF가 있으면 원문으로 채워진다.
 - **강조** — 형광펜·굵은 글씨·판서는 사라진다. "여기 굵게 해놓은 것"이 무엇인지 알 수 없다.
-- **한 줄에 두 언어가 섞인 경우** — 어느 판본을 골라도 반대쪽이 깨진다.
 - **PDF 없이 OCR만 있을 때** — `장업단계`(창업), `벤저캐피탈`(벤처)처럼 **형태는 멀쩡한데
   글자가 틀린** 것은 기준 원본 없이 구별할 방법이 없다.
+- **정확도 모드는 실행마다 결과가 조금씩 다르다** — 온도 폴백이 샘플링을 쓰기 때문이다.
 
 ## 설치
 
@@ -224,9 +271,9 @@ engine\venv\Scripts\python engine\문단화_검증.py
 | | 확인 |
 |---|---|
 | Windows 10/11 | |
-| [Python 3.11+](https://www.python.org/downloads/) | 설치 시 **"Add python.exe to PATH"** 체크 |
+| [Python 3.14](https://www.python.org/downloads/) | 의존성 버전을 3.14 기준으로 잠갔다 |
 | [ffmpeg](https://ffmpeg.org/download.html) | `winget install Gyan.FFmpeg` |
-| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) | 슬라이드를 읽지 않을 거면 생략 가능 |
+| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) | 슬라이드를 읽지 않을 거면 생략 가능. 한국어 데이터는 설치 스크립트가 받는다 |
 
 **설치**
 
@@ -245,18 +292,20 @@ MP4 입력/          ← 강의 영상을 넣는다 (하위 폴더 가능)
 강의자료 PDF/       ← 강의노트 PDF (선택, 권장)
 ```
 
-`Transcriber 실행.bat` 더블클릭 → `MD 출력/`에 결과.
+`Transcriber 실행.bat` 더블클릭 → `MD 출력/`에 결과. 바로가기나 `Transcriber 실행.bat`에
+영상을 **끌어다 놓으면** 그 파일만 바로 처리한다.
 설정은 [`설정.ini`](설정.ini), 자세한 사용법은 [사용법.md](사용법.md),
 결과물을 LLM에 넣을 때의 안내는 [CLAUDE.md](CLAUDE.md).
 
 ## 구조
 
 ```
-Transcriber 실행.bat      실행 진입점
+Transcriber 실행.bat      실행 진입점 (영상을 끌어다 놓아도 된다)
 환경 설치.bat             최초 1회 설치
 설정.ini                  사용자 설정
-engine/transcribe.py      엔진 전체 (설정·전사·OCR·PDF 정합·출력)  ~1,490줄
-engine/문단화_검증.py       단위 검증 59개
+engine/transcribe.py      엔진 전체 (설정·전사·복구·전환 검출·OCR·PDF 정합·출력)
+engine/문단화_검증.py       단위 검증 87개
+engine/종단_검증.py         합성 강의로 끝까지 돌려 채점
 engine/setup_env.py       가상환경 생성 · 의존성 · 언어 데이터 · 점검
 engine/requirements.txt   버전 잠금
 ```
@@ -271,6 +320,6 @@ engine/requirements.txt   버전 잠금
 ---
 
 이 저장소에는 **코드만** 있다. 강의 영상·전사문·강의자료는 대학 저작물이며
-인터넷 배포가 금지되어 있어 포함하지 않는다.
+인터넷 배포가 금지되어 있어 포함하지 않는다. 문서와 검증의 예시도 전부 가상 자료다.
 
 MIT License

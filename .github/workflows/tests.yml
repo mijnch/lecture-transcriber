@@ -8,7 +8,7 @@ on:
 
 jobs:
   unit:
-    # 이 도구는 Windows 전용이므로 실제 대상 플랫폼에서 검증한다.
+    # 이 도구는 Windows 전용이므로 실제 대상 플랫폼·버전에서 검증한다.
     runs-on: windows-latest
 
     # pwsh(PowerShell 7)는 스크립트를 UTF-8로 읽는다. Windows PowerShell 5.1이나
@@ -25,12 +25,19 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.14'
 
-      - name: 단위 검증 59개
-        # 표준 라이브러리만으로 도는 검증이다. 모델·ffmpeg·Tesseract 없이,
-        # 몇 시간짜리 전사 없이 문단화·OCR 판정·PDF 정합·산출물 형식을 확인한다.
-        run: python "engine/문단화_검증.py"
+      - name: 잠긴 의존성이 이 플랫폼에서 설치 가능한지
+        # 메타데이터만 받아 풀어 본다 — 휠이 없거나 버전이 빠졌으면 여기서 실패한다
+        run: python -m pip install --dry-run --ignore-installed --only-binary=:all: -r engine/requirements.txt
+
+      - name: 단위 검증 86개
+        # 모델·ffmpeg·Tesseract 없이, 몇 시간짜리 전사 없이 문단화·빠진 말소리 찾기·
+        # 화면 전환 검출·OCR 판정·PDF 정합·자막 구분·산출물 형식을 확인한다.
+        # 전환 검출만 numpy 가 필요하다.
+        run: |
+          python -m pip install --quiet numpy==2.4.6
+          python "engine/문단화_검증.py"
 
       - name: 엔진 구문 검사
         run: python -m compileall -q engine

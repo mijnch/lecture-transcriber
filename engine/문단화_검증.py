@@ -1,23 +1,33 @@
 # -*- coding: utf-8 -*-
-"""엔진 로직 단위 검증 — 전사 없이 가짜 입력으로 즉시 확인한다."""
+"""엔진 로직 단위 검증 — 전사 없이 가짜 입력으로 즉시 확인한다.
+
+표준 라이브러리만으로 돈다. 화면 전환 검출 검증만 numpy 가 필요하다(없으면 건너뛴다).
+예시 문장은 전부 가상 자료다 — 실제 강의의 조각은 어디에도 남기지 않는다.
+"""
 import sys
+import tempfile
+import types
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
 
+import transcribe as T
 from transcribe import (group_paragraphs, ends_sentence, looks_hallucinated,
                         script_mix_penalty, ocr_score, slide_key, merge_slides,
                         label_slides, video_spans, md_body_hash, merge_ocr_passes,
                         MARKER, PARA_HARD_CHARS, PARA_HARD_SEC)
 
-fails = []
+fails, passed = [], 0
 
 
 def check(name, cond, detail=""):
+    global passed
     print(f"  {'PASS' if cond else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
-    if not cond:
+    if cond:
+        passed += 1
+    else:
         fails.append(name)
 
 
@@ -69,20 +79,54 @@ check("빈 입력 처리", group_paragraphs([]) == [])
 
 # 9) 소수점·번호 뒤의 마침표는 문장 끝이 아니다
 check("소수점을 문장 끝으로 보지 않음",
-      not ends_sentence("소득세율은 3.") and not ends_sentence("항목 1.")
+      not ends_sentence("유의수준은 0.") and not ends_sentence("항목 1.")
       and ends_sentence("문장입니다.") and ends_sentence("맞습니까?"))
-p = group_paragraphs([(0, 22, "세율은 아주 길게 설명하면 이렇게 되는데 결론적으로 3."),
-                      (22.5, 25, "5 퍼센트입니다.")])
+p = group_paragraphs([(0, 22, "유의수준은 아주 길게 설명하면 이렇게 되는데 결론적으로 0."),
+                      (22.5, 25, "05 입니다.")])
 check("소수를 문단 경계로 쪼개지 않음", len(p) == 1, f"문단 {len(p)}개")
+
+# 10) 슬라이드가 바뀌면 문단을 끊는다 — 다음 슬라이드 설명이 앞 슬라이드 밑에 붙지 않게
+p = group_paragraphs([(10, 14, "첫 슬라이드 설명"), (15, 18, "다음 슬라이드 설명")], breaks=[14.5])
+check("슬라이드 전환에서 문단 분리", len(p) == 2 and p[1][0] == 15, f"{[x[0] for x in p]}")
+p = group_paragraphs([(10, 14, "첫 설명"), (15, 18, "이어지는 설명")], breaks=[9.0, 30.0])
+check("문단 밖의 전환은 무시", len(p) == 1, f"문단 {len(p)}개")
+
+print("\n구절 · 빠진 말소리")
+
+W = lambda *ws: [(a, b, w) for a, b, w in ws]
+# 11) 낱말 시각으로 긴 세그먼트를 구절로 나눈다 (핫워드를 넣으면 세그먼트가 24초로 뭉개진다)
+seg = (0.0, 24.0, "앞부분 설명입니다. 뒤 설명", False,
+       W((0.0, 0.5, " 앞부분"), (0.5, 1.2, " 설명입니다."), (6.0, 6.5, " 뒤"), (6.5, 7.0, " 설명")))
+ph = T.split_phrases([seg])
+check("낱말 시각으로 구절 분리", [x[0] for x in ph] == [0.0, 6.0], str([(x[0], x[2]) for x in ph]))
+# 12) 세그먼트 앞머리의 외톨이 낱말은 뒤 낱말과 묶이고 뒤 낱말의 시각을 쓴다
+seg = (38.5, 70.0, "이 표는 정리한 것입니다", False,
+       W((62.0, 62.2, " 이"), (66.5, 66.9, " 표는"), (67.0, 68.0, " 정리한"), (68.0, 69.0, " 것입니다")))
+ph = T.split_phrases([seg])
+check("외톨이 앞머리 낱말을 뒤로 묶음",
+      len(ph) == 1 and ph[0][0] == 66.5 and ph[0][2] == "이 표는 정리한 것입니다", str(ph))
+check("외톨이 낱말은 빈틈 계산에서 뺌", T.reliable_words(seg[4])[0][2] == " 표는")
+check("낱말 시각이 없으면 세그먼트 그대로",
+      T.split_phrases([(1.0, 3.0, "그대로입니다", True)]) == [(1.0, 3.0, "그대로입니다", True)])
+
+# 13) 말소리는 있는데 낱말이 없는 곳을 찾는다 (다른 언어로 말한 대목이 통째로 빠지는 문제)
+gaps = T.find_gaps([(0, 10), (12, 30)], [(0, 8.5), (12, 15), (25, 30)])
+check("빈틈 찾기 (숨 쉴 틈 같은 짧은 빈틈은 제외)",
+      [(round(a, 1), round(b, 1)) for a, b in gaps] == [(15.3, 24.7)],
+      str([(round(a, 1), round(b, 1)) for a, b in gaps]))
+gaps = T.find_gaps([(0, 30)], [(0, 4), (8.5, 9), (13, 30)])
+check("가까운 빈틈은 한 번에 다시 읽음",
+      [(round(a, 1), round(b, 1)) for a, b in gaps] == [(4.3, 12.7)], str(gaps))
+check("낱말이 다 덮으면 빈틈 없음", T.find_gaps([(0, 10)], [(0, 5), (5, 10)]) == [])
 
 print("\n신뢰할 수 없는 구간 표식")
 
-# 10) 세그먼트의 의심 표식이 문단까지 전달된다
+# 14) 세그먼트의 의심 표식이 문단까지 전달된다
 p = group_paragraphs([(0, 3, "정상 문장입니다.", False), (10, 13, "이상한 문장입니다.", True)])
 check("의심 표식 전달", len(p) == 2 and p[0][2] is False and p[1][2] is True,
       f"{[x[2] for x in p]}")
 
-# 11) 같은 문장이 되풀이되면 환각으로 표식한다
+# 15) 같은 문장이 되풀이되면 환각으로 표식한다
 check("반복 환각 탐지",
       looks_hallucinated("I didn't do it. I didn't do it. I didn't do it. I didn't do it.")
       and not looks_hallucinated("첫 문장입니다. 둘째 문장입니다. 셋째 문장입니다."))
@@ -91,7 +135,7 @@ check("반복 문단은 의심으로 표시", p and p[0][2] is True)
 
 print("\n슬라이드 OCR")
 
-# 12) 한글 줄에 낀 라틴 조각을 오인식으로 센다 (kor+eng 회귀 방지)
+# 16) 한글 줄에 낀 라틴 조각을 오인식으로 센다 (kor+eng 회귀 방지)
 bad = "HAS 자주 던지는 편이고 상대의 SS 끝까지 듣는다"
 good = "질문을 자주 던지는 편이고 상대의 말을 끝까지 듣는다"
 check("글자종 섞임 벌점", script_mix_penalty(bad) == 2 and script_mix_penalty(good) == 0,
@@ -100,11 +144,11 @@ check("더 잘 읽힌 판본을 고름", ocr_score([good]) > ocr_score([bad]),
       f"{ocr_score([good])} > {ocr_score([bad])}")
 check("영문 줄은 벌점 없음", script_mix_penalty("An interval of 1.96 units") == 0)
 
-# 13) 한 글자 조각은 비교에서 뺀다
+# 17) 한 글자 조각은 비교에서 뺀다
 check("비교 낱말 정리", slide_key(["표본분포 의 A ㄱ 추정"]) == {"표본분포", "추정"},
       str(sorted(slide_key(["표본분포 의 A ㄱ 추정"]))))
 
-# 14) 오인식이 심해 잘 안 겹치는 같은 슬라이드도 합친다
+# 18) 오인식이 심해 잘 안 겹치는 같은 슬라이드도 합친다
 a = ["표본추출의 기본 원리", "단순무작위추출과 층화추출", "비용 시간 정밀도"]
 b = ["Oy 표본추출의 기본 원리", "단순무작위추출과 층화추출", "비용 시간"]
 merged = merge_slides([(21.0, a), (120.0, b)])
@@ -112,98 +156,167 @@ check("오인식된 같은 슬라이드 병합", len(merged) == 1, f"{len(merged
 check("병합 시 처음 시각 유지", merged and merged[0][0] == 21.0)
 check("병합 시 잘 읽힌 판본 유지", merged and merged[0][1] == a)
 
-# 15) 다른 슬라이드는 합치지 않는다
+# 19) 다른 슬라이드는 합치지 않는다
 other = ["가설검정의 절차", "귀무가설과 대립가설", "유의수준 결정"]
 check("다른 슬라이드는 유지", len(merge_slides([(0.0, a), (60.0, other)])) == 2)
 
-# 16) 세 장 건너 되풀이되는 판본도 합친다 (직전 한 장만 보던 문제)
+# 20) 세 장 건너 되풀이되는 판본도 합친다 (직전 한 장만 보던 문제)
 c = ["표본추출의 기본 원리", "단순무작위추출과 층화추출", "비용 시간 정밀도 등"]
 check("건너뛴 중복도 병합",
       len(merge_slides([(0.0, a), (30.0, other), (60.0, c)])) == 2,
       f"{len(merge_slides([(0.0, a), (30.0, other), (60.0, c)]))}장")
 
-# 12-2) 한 화면 안에서 줄마다 잘 읽힌 쪽을 고른다 (한국어 줄은 kor, 영어 줄은 eng)
-#        입력은 (윗변 좌표, 글자, 확신도) 이다.
+# 21) 한 화면 안에서 줄마다 잘 읽힌 쪽을 고른다 (한국어 줄은 kor, 영어 줄은 eng)
+#     입력은 (윗변 좌표, 글자, 확신도) 이다.
 kor_pass = [(100, "표본의 크기를 먼저 정하고 계산한다", 92), (150, "11 [01115 [6561760.", 71)]
 eng_pass = [(102, "SAS 크기를 HAS 계산한다", 88), (148, "All rights reserved.", 94)]
 got = merge_ocr_passes([kor_pass, eng_pass])
 check("줄 단위로 좋은 판본 선택",
       got == ["표본의 크기를 먼저 정하고 계산한다", "All rights reserved."], str(got))
 
-# 12-3) 한 줄에 두 언어가 섞이면 한글을 살린다 (출처·고유명사가 정형 문구보다 중요)
+# 22) 한 줄에 두 언어가 섞이면 한글을 살린다 (출처·고유명사가 정형 문구보다 중요)
 mixed = merge_ocr_passes([[(100, "©2023. 가상마을신문. 11 [01115 [(6560060.", 78)],
                           [(101, "©2023. -HH|OtSA=. All rights reserved.", 80)]])
 check("섞인 줄에서는 한글을 보존", "가상마을신문" in mixed[0], str(mixed))
 
-# 12-4) 글자종이 같은 두 판본은 확신도로 가린다 (길이로는 깨진 쪽이 이길 수 있다)
+# 23) 글자종이 같은 두 판본은 확신도로 가린다 (길이로는 깨진 쪽이 이길 수 있다)
 eng_only = merge_ocr_passes([[(100, "A|| rights reserved by the puplisher", 62)],
                              [(100, "All rights reserved by the publisher", 93)]])
 check("같은 글자종은 확신도로 판정",
       eng_only == ["All rights reserved by the publisher"], str(eng_only))
 
-# 12-5) 한쪽에만 있는 줄은 버리지 않는다
+# 24) 한쪽에만 있는 줄은 버리지 않는다
 only = merge_ocr_passes([[(100, "위쪽 줄입니다", 90)], [(400, "아래쪽 줄입니다", 90)]])
 check("한쪽에만 잡힌 줄도 보존", only == ["위쪽 줄입니다", "아래쪽 줄입니다"], str(only))
 check("빈 결과 처리", merge_ocr_passes([[], []]) == [])
 
+print("\n화면 전환 검출")
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+    print("  (numpy 가 없어 건너뜀)")
+if np is not None:
+    def frames(total, change_at=(), moving=None, video=()):
+        """흰 바탕에 글자 한 줄씩 늘어나는 슬라이드 + 움직이는 칸 + 재생 영상 구간."""
+        rng = np.random.default_rng(0)
+        f = np.full((240, 320), 245, np.uint8)
+        lines = 0
+        for n in range(total):
+            if n in change_at:
+                lines += 1
+                f = f.copy()
+                f[20 + lines * 14:28 + lines * 14, 20:120] = 30     # 글자 한 줄(≈1%)
+            g = f.copy()
+            if moving:
+                y0, y1, x0, x1 = moving
+                g[y0:y1, x0:x1] = rng.integers(0, 255, (y1 - y0, x1 - x0))
+            if any(a <= n < b for a, b in video):
+                g[:, :210] = rng.integers(0, 255, (240, 210))
+            yield n, g
+
+    picks, _live, _shares = T.select_frames(frames(60, change_at=(10, 30)))
+    check("글자 한 줄 늘어난 전환을 잡음", picks == [0, 10, 30], str(picks))
+    picks, live_time, _ = T.select_frames(frames(60, change_at=(20, 40), moving=(0, 240, 220, 320)))
+    check("움직이는 화자 창은 무시하고 전환만 잡음",
+          20 in picks and 40 in picks and len([p for p in picks if p > 5]) == 2, str(picks))
+    check("화자 창 쪽이 움직였다고 기록", live_time[:, 14:].mean() > 0.5 > live_time[:, :12].mean())
+    picks, _l, shares = T.select_frames(frames(60, change_at=(5,), video=((20, 40),)))
+    vids = [p for p in picks if 20 <= p < 40]
+    check("영상 재생 중에는 촘촘히 봄", len(vids) >= 5, str(vids))
+    check("정지 슬라이드는 움직임 0",
+          T.live_share(shares, 5, "") == 0.0 and T.live_share(shares, 25, "crop") > 0.5)
+
 print("\n영상 자막 구분")
 
-# 17) 발화와 겹치는 짧은 화면 글자는 슬라이드가 아니라 자막
-paras = [(30.0, "안녕하세요 가상은행의 김가상입니다 오늘은 현장 경험을", False)]
-lab = label_slides([(29.0, ["안녕하세요 가상은행의 김가상입니다"]),
-                    (200.0, ["가설검정의 절차", "귀무가설과 대립가설",
-                             "유의수준 결정과 검정", "결론과 해석"])],
-                   paras)
-check("자막 판정", lab[0][2] == "자막", lab[0][2])
-check("슬라이드 오판 없음", lab[1][2] == "슬라이드", lab[1][2])
+# 25) 발화와 겹치는 짧은 화면 글자는, 화면이 움직이고 있을 때만 자막이다
+paras = [(30.0, "안녕하세요 가상연구소의 김가상입니다 오늘은 현장 경험을 말씀드립니다")]
+subs = [(29.0, ["안녕하세요 가상연구소의 김가상입니다"]),
+        (33.0, ["오늘은 현장 경험을 말씀드립니다"]),
+        (200.0, ["표본추출의 절차", "표집틀 작성", "표본 크기 결정", "추출과 조사"])]
+lab = label_slides(subs, paras, {29.0: 0.8, 33.0: 0.9})
+check("자막 판정", [x[3] for x in lab] == ["자막", "자막", "슬라이드"], str([x[3] for x in lab]))
+lab = label_slides(subs[:1], paras, {29.0: 0.0})
+check("제목을 소리 내 읽어도 화면이 가만하면 슬라이드", lab[0][3] == "슬라이드", lab[0][3])
+lab = label_slides([(29.0, ["안녕하세요 가상연구소의 김가상입니다"], "1쪽")], paras, {29.0: 0.9})
+check("PDF 쪽과 맞춰진 화면은 슬라이드", lab[0][3] == "슬라이드", lab[0][3])
+# 26) 배경이 요란해 OCR이 깨진 자막 화면도 옆 자막과 같은 영상으로 묶고, 깨진 줄은 버린다
+lab = label_slides([(29.0, ["안녕하세요 가상연구소의 김가상입니다"]),
+                    (31.0, ["빌닝ㅎ세요 ㅅ는", "|| 스즈 ㅇㅇ"]),
+                    (60.0, ["전혀 다른 정지 슬라이드 제목", "본문 내용"])],
+                   paras, {29.0: 0.8, 31.0: 0.9, 60.0: 0.0})
+check("자막 옆의 움직이는 화면도 영상", [x[3] for x in lab] == ["자막", "자막", "슬라이드"],
+      str([(x[3], x[1]) for x in lab]))
+check("움직이는 화면의 깨진 줄은 버림", lab[1][1] == [], str(lab[1][1]))
 
-# 18) 자막이 잇따르면 영상 재생 구간으로 묶는다
-spans = video_spans([(10.0, [], "자막"), (14.0, [], "자막"), (18.0, [], "자막"),
-                     (60.0, [], "슬라이드"), (90.0, [], "자막")])
-check("영상 구간 검출", spans == [(10.0, 18.0)], str(spans))
+# 27) 자막이 잇따르면 영상 재생 구간으로 묶는다
+seq = [(10.0, [], None, "자막"), (14.0, [], None, "자막"), (18.0, [], None, "자막"),
+       (60.0, [], None, "슬라이드"), (90.0, [], None, "자막")]
+check("영상 구간 검출", video_spans(seq) == [(10.0, 18.0)], str(video_spans(seq)))
+check("영상 구간은 다음 화면이 뜰 때까지",
+      video_spans(seq, [14.0, 18.0, 60.0, 90.0, 100.0]) == [(10.0, 60.0)])
+# 영상 첫 화면의 자막 OCR이 비어 버려져도, 화면이 움직이기 시작한 초까지 거슬러 올라간다
+vid = [(5.5, [], None, "슬라이드"), (79.5, [], None, "자막"), (83.5, [], None, "자막"),
+       (90.5, [], None, "슬라이드")]
+motion = [0.9 if 73 <= n <= 90 else 0.0 for n in range(100)]
+got = video_spans(vid, [79.5, 83.5, 90.5, 100.0], motion)
+check("영상 시작을 움직임으로 거슬러 찾음", got == [(72.5, 90.5)], str(got))
 
 print("\n강의자료 PDF 연동")
 
-from transcribe import (align_slides_to_pdf, pdf_hotwords, parse_course,
-                        page_key, name_tokens)
+from transcribe import (align_slides_to_pdf, pdf_hotwords, parse_course, slide_title,
+                        stem_week, drop_boilerplate)
 
-PAGES = ["자본예산의 절차\n투자안 → 현금흐름 → Fund → 할인 → 순현가\n"
-         "회수 ← 수익 ← 자본시장 · 채권시장",
+PAGES = ["표본추출의 흐름\n모집단 → 표집틀 → 표본 → 추정값\n오차 ← 편향 ← 비표본오차 · 무응답",
          "좋은 설문의 조건\n1. 질문을 짧게\n2. 유도 질문을 피할 것",
-         "표본 크기와 신뢰구간\n불편성\nCEO의 역할(기획, 실행, 평가)"]
+         "추정량의 평가 기준\n불편성\n효율성(분산, 일치성, 충분성)"]
 
-# 20) 깨진 화면 글자로도 올바른 쪽을 찾아내고, 본문은 PDF 원문으로 바뀐다
-noisy = [(1171.0, ["투자안 ao <= A 현금흐름", "순현가 nay yoy 5", "채권시장 나아"])]
+# 28) 깨진 화면 글자로도 올바른 쪽을 찾아내고, 본문은 PDF 원문으로 바뀐다
+noisy = [(1171.0, ["모집단 ao <= A 표집틀", "추정값 nay yoy 5", "비표본오차 나아"])]
 got = align_slides_to_pdf(noisy, PAGES)
 check("깨진 OCR로도 쪽을 찾음", got[0][2] == "1쪽", f"쪽={got[0][2]}")
-check("본문이 PDF 원문으로 교체됨", "Fund" in " ".join(got[0][1]), str(got[0][1])[:60])
+check("본문이 PDF 원문으로 교체됨", "표집틀 → 표본" in " ".join(got[0][1]), str(got[0][1])[:60])
 check("시각은 화면에서 잡은 그대로", got[0][0] == 1171.0)
 
-# 21) 같은 쪽이 잇따라 잡히면 한 번만 싣는다 (영상 재생 중 중복 폭증 방지)
-rep = align_slides_to_pdf([(10.0, ["투자안 현금흐름 Fund 회수"]),
-                           (40.0, ["투자안 현금흐름 Fund 수익"]),
+# 29) 같은 쪽이 잇따라 잡히면 한 번만 싣는다 (영상 재생 중 중복 폭증 방지)
+rep = align_slides_to_pdf([(10.0, ["모집단 표집틀 추정값 비표본오차"]),
+                           (40.0, ["모집단 표집틀 편향 무응답"]),
                            (70.0, ["좋은 설문의 조건 유도 질문"])], PAGES)
 check("같은 쪽 연속 중복 제거", [r[2] for r in rep] == ["1쪽", "2쪽"],
       str([r[2] for r in rep]))
 
-# 21-2) 자료가 둘이면 쪽 이름에 어느 자료인지 함께 적는다
-two = align_slides_to_pdf([(10.0, ["투자안 현금흐름 Fund 회수 순현가"])], PAGES,
-                          ["6주차교재 1쪽", "6주차교재 2쪽", "실습지 1쪽"])
-check("여러 자료의 쪽 이름 구분", two[0][2] == "6주차교재 1쪽", str(two[0][2]))
+# 30) 자료가 둘이면 쪽 이름에 어느 자료인지 함께 적는다
+two = align_slides_to_pdf([(10.0, ["모집단 표집틀 추정값 비표본오차 무응답"])], PAGES,
+                          ["7주차교재 1쪽", "7주차교재 2쪽", "실습지 1쪽"])
+check("여러 자료의 쪽 이름 구분", two[0][2] == "7주차교재 1쪽", str(two[0][2]))
 
-# 22) 어느 쪽과도 안 맞으면 화면에서 읽은 글자를 그대로 둔다
+# 31) 어느 쪽과도 안 맞으면 화면에서 읽은 글자를 그대로 둔다
 off = align_slides_to_pdf([(5.0, ["전혀 다른 화면 내용 광고 배너 문구"])], PAGES)
 check("못 맞추면 OCR 글자 유지", off[0][2] is None and off[0][1][0].startswith("전혀"))
 
-# 23) 전문용어를 뽑아 전사 힌트로 넘긴다
+# 32) 전문용어를 쉼표 목록으로 뽑는다 (문장처럼 이으면 Whisper가 문장부호를 거의 안 찍었다)
 hot = pdf_hotwords(PAGES)
-check("전문용어 추출", "자본예산" in hot and len(hot) <= 320, hot[:50])
+check("전문용어 추출", "표집틀" in hot and ", " in hot and hot.endswith(".") and len(hot) <= 320,
+      hot[:50])
+hot = pdf_hotwords(["편향은 편향을 편향의 값으로 추정한다 Sampling frame"])
+check("조사를 떼어 한 용어로 모음 · 서술어 제외",
+      hot.startswith("편향,") and "값으로" in hot and "값으," not in hot
+      and "추정한다" not in hot and "Sampling" in hot and "frame" not in hot, hot)
 
-# 22-2) 차례 제목은 배너·절번호·잡음을 건너뛰고 쓸 만한 줄을 고른다
-from transcribe import slide_title
-_p1 = ["S A M P L E U N I V E R S I T Y", "담당교수ㅣ 가 상 인", "6주차 1교시", "표본통계학"]
+# 33) 대부분의 쪽에 되풀이되는 배너·꼬리말은 뺀다
+pages = [["S A M P L E  U N I V E R S I T Y", f"{i}번째 쪽 제목", "공통 아님" if i < 3 else "본문"]
+         for i in range(6)]
+clean = drop_boilerplate(pages)
+check("되풀이되는 배너 제거", all("S A M P L E" not in " ".join(p) for p in clean)
+      and clean[0][0] == "0번째 쪽 제목", str(clean[0]))
+check("절반만 나오는 줄은 유지", sum("공통 아님" in p for p in clean) == 3)
+check("쪽이 적으면 건드리지 않음", drop_boilerplate(pages[:3]) == pages[:3])
+
+# 34) 차례 제목은 배너·절번호·잡음을 건너뛰고 쓸 만한 줄을 고른다
+_p1 = ["S A M P L E U N I V E R S I T Y", "담당교수ㅣ 가 상 인", "7주차 2교시", "표본통계학"]
 check("배너·낱자 줄을 건너뛰고 쓸 만한 줄을 고름",
-      slide_title(_p1) == "6주차 1교시", str(slide_title(_p1)))
+      slide_title(_p1) == "7주차 2교시", str(slide_title(_p1)))
 check("단독 절번호를 건너뜀",
       slide_title(["01", "표본설계의 원칙"]) == "표본설계의 원칙")
 check("잡음뿐이면 제목 없음", slide_title(["~ SS"]) is None and slide_title(["| Sy \\"]) is None)
@@ -223,13 +336,12 @@ check("괄호·쉼표가 있어도 통과",
       slide_title(["CEO의 역할(기획, 실행, 평가)"]) == "CEO의 역할(기획, 실행, 평가)",
       str(slide_title(["CEO의 역할(기획, 실행, 평가)"])))
 
-# 23-2) 자료 이름에서 주차를 읽어, 다른 주차 자료가 붙는 사고를 막는다
-from transcribe import stem_week
+# 35) 자료 이름에서 주차를 읽어, 다른 주차 자료가 붙는 사고를 막는다
 check("자료 이름에서 주차 파악",
-      stem_week("6주차교재-표본통계학") == 6 and stem_week("6표본설계-표본통계학") == 6
-      and stem_week("표본통계학") is None, str(stem_week("6주차교재-표본통계학")))
+      stem_week("7주차교재-표본통계학") == 7 and stem_week("7표본설계-표본통계학") == 7
+      and stem_week("표본통계학") is None, str(stem_week("7주차교재-표본통계학")))
 
-# 24) 파일 이름에서 과목·주차·교시를 읽는다
+# 36) 파일 이름에서 과목·주차·교시를 읽는다
 check("과목/주차/교시 파악",
       parse_course("재무관리 12-1강") == ("재무관리", 12, 1)
       and parse_course("DATA SCIENCE 9-3") == ("DATA SCIENCE", 9, 3)
@@ -237,7 +349,7 @@ check("과목/주차/교시 파악",
 
 print("\n산출물 지문")
 
-# 19) 본문이 같으면 같은 지문, 마커가 달라도 무관하다
+# 37) 본문이 같으면 같은 지문, 마커가 달라도 무관하다
 body = "# 강의\n\n**[00:00:00]** 안녕하세요.\n"
 h1 = md_body_hash(body + MARKER + ' {"a": 1} -->\n')
 h2 = md_body_hash(body + MARKER + ' {"a": 2} -->\n')
@@ -245,45 +357,72 @@ check("마커는 지문에 영향 없음", h1 == h2)
 check("본문이 바뀌면 지문도 바뀜",
       md_body_hash(body + "사용자 메모\n" + MARKER + " {} -->\n") != h1)
 
-print("\n산출물 생성")
+print("\n입력 고르기 · 산출물 생성")
 
-import tempfile, types
-from pathlib import Path
-from transcribe import write_markdown, read_marker, tmp_root
+with tempfile.TemporaryDirectory(prefix="mdcheck_", dir=T.tmp_root()) as td:
+    td = Path(td)
+    T.IN_DIR, T.OUT_DIR, T.PDF_DIR = td / "in", td / "out", td / "pdf"
+    for d in (T.IN_DIR, T.OUT_DIR, T.PDF_DIR):
+        d.mkdir()
+    cfg = {"model": "large-v3-turbo", "language": "auto", "beam_size": 1,
+           "슬라이드_읽기": True, "ocr_언어": "자동"}
 
-with tempfile.TemporaryDirectory(prefix="mdcheck_", dir=tmp_root()) as td:
-    out = Path(td) / "재무관리 12-1강.md"
-    src = Path(td) / "재무관리 12-1강.mp4"
+    # 38) 끌어다 놓은 파일만 처리한다 — 입력 폴더의 다른 파일까지 몇 시간짜리 작업을 벌이지 않게
+    (T.IN_DIR / "재무관리 1-1강.mp4").write_bytes(b"a")
+    (T.IN_DIR / "재무관리 1-2강.mp4").write_bytes(b"b")
+    outside = td / "밖"
+    outside.mkdir()
+    (outside / "재무관리 1-3강.mp4").write_bytes(b"c")
+    (outside / "재무관리 1-1강.mp4").write_bytes(b"another file")
+    chosen = T.stage_dropped([outside / "재무관리 1-3강.mp4", outside / "재무관리 1-1강.mp4"])
+    check("이름만 같은 다른 파일은 대신 처리하지 않음",
+          [p.name for p in chosen] == ["재무관리 1-3강.mp4"], str([p.name for p in chosen]))
+    targets = T.plan_targets(cfg, set(chosen))[0]
+    check("끌어다 놓은 것만 대상", [f.name for f, _ in targets] == ["재무관리 1-3강.mp4"],
+          str([f.name for f, _ in targets]))
+    check("인자 없이 실행하면 폴더 전체", len(T.plan_targets(cfg)[0]) == 3)
+    T.unstage(T._STAGED)
+    check("끌어다 놓기로 만든 이름은 치움", not (T.IN_DIR / "재무관리 1-3강.mp4").exists()
+          and (outside / "재무관리 1-3강.mp4").exists())
+
+    out = td / "재무관리 12-1강.md"
+    src = td / "재무관리 12-1강.mp4"
     src.write_bytes(b"x" * 100)
     info = types.SimpleNamespace(duration=2828.0, language="ko", language_probability=1.0)
     paras = [(10.0, "오늘은 자본예산을 보겠습니다.", False),
              (1180.0, "이 도표를 보시면 현금흐름이 순환합니다.", False),
              (1500.0, "안녕하세요 가상은행의 김가상입니다", False),
              (1505.0, "오늘은 현장 경험을 말씀드립니다", False),
+             (1512.0, "영상에서 보셨듯이 현장이 중요합니다.", False),
              (2000.0, "이상한 소리가 계속됩니다.", True)]
-    slides = [(1171.0, ["자본예산의 절차", "투자안 → 현금흐름 → Fund"], "1쪽"),
-              (1495.0, ["안녕하세요 가상은행의 김가상입니다"], None),
-              (1502.0, ["오늘은 현장 경험을"], None)]
-    cfg = {"model": "large-v3-turbo", "language": "auto", "beam_size": 1,
-           "batch_size": 1, "정확도_우선": True, "슬라이드_읽기": True, "ocr_언어": "자동"}
-    write_markdown(out, src, info, paras, cfg, 1200.0, 0.0, slides, "재무관리 12주차.pdf")
+    screens = [(1171.0, ["자본예산의 절차", "투자안 → 현금흐름 → 할인"], "1쪽", "슬라이드"),
+               (1495.0, ["안녕하세요 가상은행의 김가상입니다"], None, "자막"),
+               (1502.0, ["오늘은 현장 경험을", "안녕하세요 가상은행의 김가상입니다"], None, "자막"),
+               (1510.0, ["현장의 교훈", "표본은 매년 새로"], None, "슬라이드")]
+    T.write_markdown(out, src, info, paras, cfg, screens, "재무관리 12주차.pdf",
+                     repaired=[(300.0, 320.0)], lost=[(2400.0, 2412.0)])
     t = out.read_text(encoding="utf-8")
 
     check("머리말(frontmatter) 기록", t.startswith("---\n과목: 재무관리\n주차: 12\n교시: 1"))
-    check("강의자료 이름 기록", "강의자료: 재무관리 12주차.pdf" in t)
+    check("강의자료·모델 기록", "강의자료: 재무관리 12주차.pdf" in t and "모델: large-v3-turbo" in t)
     check("화면 차례 생성", "## 화면 차례" in t and "1쪽 자본예산의 절차" in t)
     check("슬라이드에 쪽번호와 유지 구간",
           "🖵 슬라이드 1쪽 [00:19:31 – 00:24:55]" in t,
           str([l for l in t.splitlines() if "🖵" in l][:1]))
-    check("영상 자막 분리", "📺 영상 자막" in t)
-    check("영상 구간 발화에 📺", "**[00:25:00]** 📺 " in t,
-          str([l for l in t.splitlines() if l.startswith("**[00:25:00]")][:1]))
+    check("잇따른 자막은 한 블록으로, 줄은 한 번씩",
+          t.count("📺 영상 자막") == 1 and "[00:24:55 – 00:25:10]" in t
+          and t.count("> 안녕하세요 가상은행의 김가상입니다") == 1)
+    check("영상 구간 발화에 📺", "**[00:25:00]** 📺 " in t and "**[00:25:05]** 📺 " in t,
+          str([l for l in t.splitlines() if l.startswith("**[00:25:0")][:2]))
+    check("영상이 끝난 뒤 교수의 말에는 📺 없음", "**[00:25:12]** 영상에서" in t)
     check("의심 문단에 ⚠", "**[00:33:20]** ⚠ 이상한" in t)
-    check("머리말에 경고 요약", "재생된 영상 1곳" in t and "흔들린 문단 1개" in t)
+    check("옮기지 못한 말소리 구간 표시", "**[00:40:00]** ⚠ *(여기서 12초 동안" in t)
+    check("머리말에 경고 요약", "재생된 영상 1곳" in t and "흔들린 문단 1개" in t
+          and "빠졌던 말소리 1곳(20초)" in t and "옮기지 못한 구간 1곳" in t)
 
-    mark = read_marker(out, src.name)
+    mark = T.read_marker(out)
     check("마커 왕복", mark and mark.get("pdf") == "재무관리 12주차.pdf"
           and mark.get("sha") == md_body_hash(t), str(mark)[:80])
 
-print(f"\n결과: {'전부 통과' if not fails else '실패 ' + ', '.join(fails)}")
+print(f"\n결과: {'전부 통과' if not fails else '실패 ' + ', '.join(fails)} ({passed}/{passed + len(fails)})")
 sys.exit(1 if fails else 0)
