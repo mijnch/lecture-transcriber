@@ -28,10 +28,12 @@ jobs:
           python-version: '3.14'
 
       - name: 잠긴 의존성이 이 플랫폼에서 설치 가능한지
-        # 메타데이터만 받아 풀어 본다 — 휠이 없거나 버전이 빠졌으면 여기서 실패한다
-        run: python -m pip install --dry-run --ignore-installed --only-binary=:all: -r engine/requirements.txt
+        # 메타데이터만 받아 풀어 본다 — 휠이 없거나 버전이 빠졌으면 여기서 실패한다.
+        # ':all: ' 의 콜론+공백을 YAML 이 키로 읽으므로 블록 문자열로 쓴다.
+        run: |
+          python -m pip install --dry-run --ignore-installed --only-binary=:all: -r engine/requirements.txt
 
-      - name: 단위 검증 86개
+      - name: 단위 검증 87개
         # 모델·ffmpeg·Tesseract 없이, 몇 시간짜리 전사 없이 문단화·빠진 말소리 찾기·
         # 화면 전환 검출·OCR 판정·PDF 정합·자막 구분·산출물 형식을 확인한다.
         # 전환 검출만 numpy 가 필요하다.
