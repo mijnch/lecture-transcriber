@@ -2396,11 +2396,15 @@ def cleanup_stale_temp():
     freed = 0
     cutoff = time.time() - 6 * 3600
     stale = []
-    for root in (TMP_ROOT, Path(tempfile.gettempdir())):
-        try:
-            stale += [d for d in root.glob("transcriber_*") if d.is_dir()]
-        except OSError:
-            pass
+    # ocr_* 는 화면 한 장을 읽을 때 쓰는 폴더다 — 강제 종료되면 이것도 남는다(강의 화면 이미지).
+    # 흔한 이름이라 도구 폴더 안에서만 치운다 — %TEMP% 에서는 다른 프로그램의 것일 수 있다
+    for root, patterns in ((TMP_ROOT, ("transcriber_*", "ocr_*")),
+                           (Path(tempfile.gettempdir()), ("transcriber_*",))):
+        for pattern in patterns:
+            try:
+                stale += [d for d in root.glob(pattern) if d.is_dir()]
+            except OSError:
+                pass
     for d in stale:
         try:
             if d.stat().st_mtime > cutoff:
