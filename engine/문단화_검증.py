@@ -154,6 +154,11 @@ fs = T.foreign_spans([(0, 3, "Let me show you a clip.", False), (4, 8, "가상 �
 check("영어 강의 속 한글 문장 구간", fs == [(4, 12, "ko")], str(fs))
 check("한국어 강의 속 짧은 영어 용어는 근거가 아님",
       T.foreign_spans([(0, 3, "이것이 Supply Chain 입니다", False)], "ko") == [])
+tail_ko = (40.0, 52.0, "Evening visits doubled the response rate everywhere. 다음", False,
+           W((40.0, 41.0, " Evening"), (41.0, 42.0, " visits"), (42.0, 43.0, " doubled"), (43.0, 44.0, " the"),
+             (44.0, 45.0, " response"), (45.0, 46.0, " rate"), (46.0, 47.5, " everywhere."), (51.0, 52.0, " 다음")))
+check("다른 언어 구간은 그 문자의 낱말이 있는 곳까지", T.foreign_spans([tail_ko], "ko") == [(40.0, 47.5, "en")],
+      str(T.foreign_spans([tail_ko], "ko")))
 
 # 13-6) 영상 속 정지 글자 카드로 끊긴 구간은 잇되, 교수가 돌아온 틈은 잇지 않는다
 scr = [(100.0, ["a"], None, "자막"), (131.0, ["정지 카드"], None, "슬라이드"), (140.0, ["b"], None, "자막"),
@@ -180,6 +185,22 @@ pen = [0.03 if 300 <= n < 400 else 0.0 for n in range(600)]    # 판서는 가�
 check("판서 수준의 움직임은 영상이 아님", T.motion_video_spans(pen, url) == [])
 cam = [0.2] * 600                                               # 카메라만 비추는 강의
 check("정지 슬라이드가 거의 없는 강의는 움직임으로 가르지 않음", T.motion_video_spans(cam, url) == [])
+# 슬라이드 넘김 한 번(7초 앞) + 영상 26초 + 교수 슬라이드 7초 + 영상 20초 — 창을 밀며 보던 때는
+# 넘김 순간부터 두 영상과 그 사이 교수 슬라이드까지 한 영상으로 묶였다
+two = [0.0] * 600
+two[93] = 0.9
+for n in list(range(100, 126)) + list(range(133, 153)):
+    two[n] = 0.3
+mv = T.motion_video_spans(two, [(92.5, ["출처: https://www.youtube.com/watch?v=abc"], None, "슬라이드"),
+                               (125.5, ["출처: https://youtu.be/xyz"], None, "슬라이드")])
+check("사이의 짧은 교수 슬라이드와 앞 넘김 순간은 영상이 아님",
+      mv == [(99.5, 125.5), (132.5, 152.5)], str(mv))
+flips = [0.0] * 600
+flips[94] = flips[96] = 0.8                     # 영상 직전 슬라이드를 두 번 넘김(4초 안이라 이어진다)
+for n in range(100, 131):
+    flips[n] = 0.3
+mv = T.motion_video_spans(flips, [(93.5, ["출처: https://youtu.be/xyz"], None, "슬라이드")])
+check("영상에 이어 붙은 슬라이드 넘김은 영상 시작이 아님", mv == [(99.5, 130.5)], str(mv))
 # 13-8) 영상 속 글자 카드가 32초 동안 4장 — 30초를 넘어도 같은 영상으로 잇는다
 cards = [(100.0, ["a"], None, "자막"), (131.0, ["카드1"], None, "슬라이드"), (134.0, ["카드2"], None, "슬라이드"),
          (137.0, ["카드3"], None, "슬라이드"), (150.0, ["카드4"], None, "슬라이드"), (163.0, ["b"], None, "자막")]
@@ -188,6 +209,87 @@ check("빠르게 바뀌는 글자 카드 틈은 이음", sp == [(100.0, 200.0)],
 slow = [(100.0, ["a"], None, "자막"), (131.0, ["교수 슬라이드"], None, "슬라이드"), (180.0, ["b"], None, "자막")]
 sp, _sc = T.join_video_spans([(100.0, 131.0), (180.0, 200.0)], slow)
 check("한 장이 오래 뜬 틈(교수 슬라이드)은 잇지 않음", sp == [(100.0, 131.0), (180.0, 200.0)], str(sp))
+# 13-9) 영어 강의에서 튼 영어 인터뷰 — 말도 같은 언어라 언어 근거가 없고 출처 주소도 없다.
+#       움직이는 화면의 짧은 글자가 강의 언어와 다른 문자(한글 자막)면 영상이다
+subs_ko = [(298.0, ["Interview"], None, "슬라이드"), (305.0, ["가상 인터뷰의 첫 번째 자막입니다"], None, "슬라이드"),
+           (320.0, ["두 번째 자막 문장이 이어집니다"], None, "슬라이드"), (400.0, ["Next topic"], None, "슬라이드")]
+mv = T.motion_video_spans(talk, subs_ko, lang="en")
+check("움직임 + 강의 언어와 다른 자막 = 재생 영상", len(mv) == 1 and mv[0][1] >= 390, str(mv))
+check("강의 언어와 같은 문자의 화면 글자는 근거가 아님", T.motion_video_spans(talk, subs_ko, lang="ko") == [])
+# 13-10) 교수가 슬라이드의 외국어 기사를 소리 내 읽은 뒤 영상을 틀면, 영상은 화면이 계속
+#        움직이기 시작한 때부터다 — 읽은 대목(화면 정지)은 교수의 말이다
+read_then_play = [0.0] * 300
+read_then_play[105] = 0.9                       # 읽는 도중 한 번 넘긴 슬라이드
+for n in range(112, 161):
+    read_then_play[n] = 0.8
+sp, _sc = T.add_language_spans([], [], [(100.0, 160.0, "ko")], read_then_play)
+check("외국어 구간의 영상 시작은 계속 움직이기 시작한 초", sp == [(111.5, 160.0)], str(sp))
+cursor = [0.03 if 100 <= n < 112 else 0.8 if n < 161 else 0.0 for n in range(300)]
+sp, _sc = T.add_language_spans([], [], [(100.0, 160.0, "ko")], cursor)
+check("커서·판서 수준의 움직임은 영상 시작이 아님", sp == [(111.5, 160.0)], str(sp))
+# 출처 슬라이드가 영상 26초 전에 뜨고 주소는 잘렸지만 참고문헌 표기('[video file]')가 남은 경우
+cite = [(274.0, ["Sample News. (2024.3.2). Sample story. [video file]. Retrieved from"], None, "슬라이드")]
+mv = T.motion_video_spans(talk, cite)
+check("30초 전 출처 표기([video file])도 영상 근거", len(mv) == 1, str(mv))
+# 13-11) 영상이 끝나며 슬라이드로 서서히 넘어가면 그 슬라이드가 영상에 묶였다 — 뜬 뒤 전혀
+#        움직이지 않은 화면이 구간 끝에 있으면 떼어 낸다. 영상 속 정지 카드는 끝이 아니면 둔다
+fade = [0.5 if 100 <= n <= 111 else 0.0 for n in range(300)]
+tail = [(100.0, ["자막 하나"], None, "자막"), (104.0, ["자막 둘"], None, "자막"),
+        (110.0, ["다음 슬라이드 제목", "본문 한 줄"], None, "자막"), (160.0, ["그다음 슬라이드"], None, "슬라이드")]
+sp, sc = T.trim_still_tail([(100.0, 160.0)], tail, fade, 300.0)
+check("영상 뒤 멈춘 슬라이드를 구간에서 떼어 냄", sp == [(100.0, 110.0)] and sc[2][3] == "슬라이드",
+      f"{sp} {sc[2][3]}")
+card = [0.5 if 100 <= n <= 105 or 110 <= n <= 130 else 0.0 for n in range(300)]
+mid = [(100.0, ["자막"], None, "자막"), (105.0, ["정지 카드"], None, "자막"), (110.0, ["자막"], None, "자막"),
+       (140.0, ["교수 슬라이드"], None, "슬라이드")]
+sp, sc = T.trim_still_tail([(100.0, 140.0)], mid, card, 300.0)
+check("영상 속 정지 카드는 구간 끝이 아니면 그대로", sp[0][0] == 100.0 and sp[0][1] >= 129 and sc[1][3] == "자막",
+      str(sp))
+# 영상이 끝나 마지막 화면이 멈춘 채 다음 슬라이드가 몇 초 뒤에 뜨면, 멈춘 때에서 끊는다
+frozen = [0.5 if 100 <= n <= 128 else 1.0 if n == 129 else 0.0 for n in range(300)]
+sp, _sc = T.trim_still_tail([(100.0, 134.5)], [(100.0, ["자막"], None, "자막")], frozen, 300.0)
+check("영상 끝 멈춘 화면 동안의 말은 영상이 아님", sp == [(100.0, 128.5)], str(sp))
+tail_card = [0.5 if 100 <= n <= 128 else 0.04 if n in (130, 132) else 1.0 if n == 129 else 0.0 for n in range(300)]
+sp, _sc = T.trim_still_tail([(100.0, 134.5)], [(100.0, ["자막"], None, "자막")], tail_card, 300.0)
+check("조금이라도 움직이는 마지막 화면(영상 끝 카드)은 그대로", sp == [(100.0, 134.5)], str(sp))
+pen = [0.5 if 100 <= n <= 111 else (0.6 if n in (118, 131, 150) else 0.03 if n % 7 == 0 else 0.0)
+       for n in range(300)]
+sp, sc = T.trim_still_tail([(100.0, 160.0)], tail, pen, 300.0)
+check("영상 뒤 슬라이드에 판서·커서가 조금 있어도 뗌", sp == [(100.0, 110.0)] and sc[2][3] == "슬라이드", str(sp))
+page_tail = [(100.0, ["자막"], None, "자막"), (121.0, ["교수 슬라이드"], "4쪽", "슬라이드")]
+sp, _sc = T.trim_still_tail([(100.0, 122.5)], page_tail, [0.5] * 300, 300.0)
+check("구간 끝에 뜬 강의자료 쪽은 움직임과 상관없이 뗌", sp == [(100.0, 121.0)], str(sp))
+# 13-12) 교수가 말을 마치자마자 영상이 시작되면 한 구절로 묶였다 — 영상 경계에서 구절을 나눈다
+seg = (10.0, 12.6, "교수의 마지막 말 영상의 첫마디", False,
+       W((10.0, 10.5, " 교수의"), (10.5, 11.0, " 마지막"), (11.2, 11.6, " 말"),
+         (11.8, 12.2, " 영상의"), (12.2, 12.6, " 첫마디")))
+check("영상 경계에서 구절을 나눔",
+      [x[2] for x in T.split_phrases([seg], cuts=[11.7])] == ["교수의 마지막 말", "영상의 첫마디"]
+      and len(T.split_phrases([seg])) == 1, str(T.split_phrases([seg], cuts=[11.7])))
+check("글자 없는 구절('... ...')은 버림",
+      T.split_phrases([(0.0, 2.0, "... ...", False), (3.0, 4.0, "말입니다.", False)]) == [(3.0, 4.0, "말입니다.", False)])
+
+# 13-13) 다른 언어 영상 안에 남은 ⚠ 는 그 영상의 언어로 고정해 다시 읽는다 (가짜 모델)
+class FakeModel:
+    def __init__(self):
+        self.calls = []
+
+    def transcribe(self, clip, language=None, **kw):
+        self.calls.append(language)
+        w = lambda a, b, t: types.SimpleNamespace(start=a, end=b, word=t)
+        seg = types.SimpleNamespace(start=0.5, end=7.5, text=" 가상 현장의 목소리입니다", avg_logprob=-0.3,
+                                    no_speech_prob=0.05,
+                                    words=[w(0.5, 3.0, " 가상"), w(3.0, 5.0, " 현장의"), w(5.0, 7.5, " 목소리입니다")])
+        return iter([seg]), types.SimpleNamespace(language=language, language_probability=1.0)
+fm = FakeModel()
+segs = [(0.0, 5.0, "Intro by the professor.", False, []), (100.0, 104.0, "Made up line one.", True, []),
+        (104.5, 108.0, "Made up line two.", True, []), (200.0, 205.0, "Outside the clip.", True, [])]
+new, done = T.reread_video_suspects(fm, [0.0] * (16000 * 300), segs, [(90.0, 120.0)],
+                                    [(92.0, 99.0, "ko")], {"beam_size": 1})
+check("외국어 영상 속 ⚠ 를 그 언어로 다시 읽음",
+      done == [(100.0, 108.0, "ko")] and fm.calls == ["ko"]
+      and any("목소리입니다" in s[2] for s in new) and not any("Made up" in s[2] for s in new), str(done))
+check("영상 밖의 ⚠ 는 건드리지 않음", any(s[2] == "Outside the clip." for s in new))
 
 print("\n신뢰할 수 없는 구간 표식")
 
@@ -258,7 +360,48 @@ check("같은 글자종은 확신도로 판정",
 # 24) 한쪽에만 있는 줄은 버리지 않는다
 only = merge_ocr_passes([[(100, "위쪽 줄입니다", 90)], [(400, "아래쪽 줄입니다", 90)]])
 check("한쪽에만 잡힌 줄도 보존", only == ["위쪽 줄입니다", "아래쪽 줄입니다"], str(only))
+# 큰 글자는 판본마다 윗변이 30화소 넘게 달라도 세로로 겹치면 같은 줄이다 (다섯째 값이 아랫변)
+tall = merge_ocr_passes([[(400, "표본의 크기를 정한다", 90, 0.5, 490), (600, "다음 줄", 90, 0.3, 690)],
+                         [(435, "SAS 크기를 정한다", 70, 0.5, 520), (630, "다음 줄", 80, 0.3, 720)]])
+check("세로로 겹치는 줄은 한 줄로 맞댐", tall == ["표본의 크기를 정한다", "다음 줄"], str(tall))
 check("빈 결과 처리", merge_ocr_passes([[], []]) == [])
+
+# 24-2) 잘라 읽다 가장자리에서 끊긴 줄만 넓게 읽은 판본으로 늘린다 (넷째 값이 오른쪽 끝)
+cut_lines = [(100, "표본의 크기를 먼저 정하고 계", 90, 0.99), (200, "짧은 제목 줄", 92, 0.45),
+             (300, "가장자리에 닿은 줄 끝", 90, 0.98)]
+wide = ["표본의 크기를 먼저 정하고 계산한 뒤 올림한다", "짧은 제목 줄 가상대학교", "가장자리에 닿은 줄 끝 ㅣ"]
+got = T.extend_cut_lines(cut_lines, wide)
+check("끊긴 줄은 넓은 판본으로 늘림", got[0] == "표본의 크기를 먼저 정하고 계산한 뒤 올림한다", got[0])
+check("가장자리에 닿지 않은 줄에는 로고가 붙지 않음", got[1] == "짧은 제목 줄", got[1])
+check("한두 글자 조각(화자 가장자리)은 붙이지 않음", got[2] == "가장자리에 닿은 줄 끝", got[2])
+got = T.extend_cut_lines([(100, "점이 한계를 벗어나면 공정을 멈추고 즉시", 90, 1.0), (200, "능력을 보는 도구", 90, 1.0),
+                          (300, "관리한계선은 평균에서 떨어진 관리한겨", 90, 1.0)],
+                         ["심히 한계를 벗어나면 콩정을 멈추고 즉시조치한다", "능력을 보는 도구이다",
+                          "관리한계선은 평균에서 떨어진 관리한계선이다"])
+check("앞부분은 잘라 읽은 판본 그대로, 잘린 뒤꼬리만 이어 붙임",
+      got[0] == "점이 한계를 벗어나면 공정을 멈추고 즉시조치한다", got[0])
+check("두 글자 뒤꼬리도 이어 붙임", got[1] == "능력을 보는 도구이다", got[1])
+check("경계에 걸려 반쯤 잘린 글자는 넓은 판본으로", got[2] == "관리한계선은 평균에서 떨어진 관리한계선이다", got[2])
+# 24-3) 그림·괘선을 읽은 잡음 줄 — 숫자만 있는 표 줄은 남긴다
+check("괘선을 읽은 줄은 잡음", T.ocr_junk("1 | | | | | | | 1. | |. | |") and T.ocr_junk("| Sy \\"))
+check("숫자 표 줄과 보통 줄은 남김", not T.ocr_junk("- 31 47 26 58 72 19")
+      and not T.ocr_junk("관리도의 중심선") and not T.ocr_junk("GDP"))
+check("숫자·기호뿐인 줄은 더 확신할 때만 (사진 잡음 가려내기)",
+      T.bare_line("- 31 47 26 58 72 19") and T.bare_line("Qe 4 「") and T.bare_line("90% 1.645")
+      and not T.bare_line("관리도 7") and not T.bare_line("GDP 3%"))
+check("두 음절 한글 제목은 남기고 낱자 조각은 버림",
+      not T.ocr_junk("정리") and not T.ocr_junk("목차") and T.ocr_junk("가 |") and T.ocr_junk("ㅅ ㅁ"))
+# 24-4) 자동 언어면 섞인 판본(kor+eng)을 세 번째 후보로 읽는다
+_tess = T.TESSDATA_DIR
+with tempfile.TemporaryDirectory(prefix="tessdata_", dir=T.tmp_root()) as _td:
+    T.TESSDATA_DIR = Path(_td)
+    (T.TESSDATA_DIR / "kor.traineddata").write_bytes(b"")
+    auto = {"ocr_언어": "자동"}
+    check("읽을 언어 후보: 단독 둘 + 섞인 판본",
+          T.ocr_lang_options(auto, "ko") == ["kor", "eng", "kor+eng"]
+          and T.ocr_lang_options(auto, "en") == ["eng", "kor", "kor+eng"]
+          and T.ocr_lang_options({"ocr_언어": "eng"}, "ko") == ["eng"])
+T.TESSDATA_DIR = _tess
 
 print("\n화면 전환 검출")
 
@@ -288,10 +431,19 @@ if np is not None:
 
     picks, _left, _live, _shares = T.select_frames(frames(60, change_at=(10, 30)))
     check("글자 한 줄 늘어난 전환을 잡음", picks == [0, 10, 30], str(picks))
-    picks, _left, live_time, _ = T.select_frames(frames(60, change_at=(20, 40), moving=(0, 240, 220, 320)))
+    picks, _left, calm, _ = T.select_frames(frames(60, change_at=(20, 40), moving=(0, 240, 220, 320)))
     check("움직이는 화자 창은 무시하고 전환만 잡음",
           20 in picks and 40 in picks and len([p for p in picks if p > 5]) == 2, str(picks))
-    check("화자 창 쪽이 움직였다고 기록", live_time[:, 14:].mean() > 0.5 > live_time[:, :12].mean())
+    check("슬라이드가 멈춘 동안 화자 쪽이 움직였다고 기록", calm[:, 14:].mean() > 0.5 > calm[:, :12].mean())
+    # 화자 자리만 가린다 — 화자와 이어진 칸들만, 줄마다 상자 하나씩
+    blob = np.zeros((15, 20))
+    blob[6:15, 14:19] = 0.5
+    blob[2, 3] = 0.3                              # 슬라이드 쪽의 작은 움직임(화자와 떨어짐)
+    mask = T.speaker_mask(blob, 13)
+    check("화자와 이어진 칸만 가림", mask.count("drawbox") == 9 and "y=ih*0.1333" not in mask,
+          f"상자 {mask.count('drawbox')}개")
+    check("화자가 없으면 가리지 않음", T.speaker_mask(np.zeros((15, 20)), 13) == "")
+    check("가림 상자는 슬라이드 배경 밝기로", "color=0xF4F4F4" in T.speaker_mask(blob, 13, 244))
 
     def fidget(total, change_at):
         """화자가 가끔씩만 움직인다 — '계속 움직이는 칸'으로는 걸러지지 않는다."""
@@ -308,6 +460,13 @@ if np is not None:
     check("영상 재생 중에는 촘촘히 봄", len(vids) >= 5, str(vids))
     check("정지 슬라이드는 움직임 0",
           T.live_share(shares, 5, "") == 0.0 and T.live_share(shares, 25, "crop") > 0.5)
+    # 자르기 판단에 쓸 화면은 슬라이드가 멈춰 있던 것 중에서 고르게 — 영상 재생 중 화면은 빼고
+    moving_shares = [(0.0, 0.0)] * 30 + [(0.8, 0.8)] * 30 + [(0.0, 0.0)] * 40
+    picked = T.still_samples([0, 5, 12, 20, 33, 36, 45, 50, 65, 80, 95], moving_shares, 100.0, k=5)
+    check("자르기 판단 표본은 멈춘 슬라이드에서", picked and all(not (30 <= t - 1 < 60) for t in picked)
+          and len(picked) == 5, str(picked))
+    faded = [(0.0, 0.0)] * 11 + [(1.0, 1.0), (1.0, 1.0)] + [(0.0, 0.0)] * 10
+    check("서서히 넘어온 슬라이드(전환 2초)는 움직이는 화면이 아님", T.live_share(faded, 10, "") == 0.0)
 
 print("\n영상 자막 구분")
 
@@ -330,6 +489,25 @@ lab = label_slides([(29.0, ["안녕하세요 가상연구소의 김가상입니�
 check("자막 옆의 움직이는 화면도 영상", [x[3] for x in lab] == ["자막", "자막", "슬라이드"],
       str([(x[3], x[1]) for x in lab]))
 check("움직이는 화면의 깨진 줄은 버림", lab[1][1] == [], str(lab[1][1]))
+# 자막 줄 끝에 붙은 잡음 조각 하나 때문에 멀쩡한 자막을 통째로 버리지 않는다
+check("자막 줄의 잡음 조각만 뗌",
+      T.clean_moving_line("녕하세요 저는 가상연구소의 김가상입니다 <”") == "녕하세요 저는 가상연구소의 김가상입니다"
+      and T.clean_moving_line("그래서 저희는 “=: 매년 새로 만듭니다") == "그래서 저희는 매년 새로 만듭니다"
+      and T.clean_moving_line("현장에서는 a “ mes es een") == "현장에서는",
+      T.clean_moving_line("현장에서는 a “ mes es een"))
+lab = label_slides([(29.0, ["안녕하세요 가상연구소의 김가상입니다 <”"])], paras, {29.0: 0.8})
+check("잡음 조각이 붙은 자막도 자막으로", lab and lab[0][3] == "자막" and "<" not in lab[0][1][0], str(lab))
+lab = label_slides([(30.0, ["se an"])], [(31.0, "Our team visits every household before the response rate")],
+                   {30.0: 0.9})
+check("2연쇄 몇 개뿐인 잡음은 발화와 우연히 겹쳐도 자막이 아님", lab and lab[0][3] == "슬라이드", str(lab))
+# 영상 직후 슬라이드는 움직이던 영역이 비교에 다시 들어올 때 늦게 골라진다 — 실제로 뜬 초를 쓴다
+after_video = [0.5] * 10 + [0.9, 0.0, 0.0, 0.0, 0.0]
+build_step = [0.0] * 10 + [0.8, 0.0, 0.0, 0.0, 0.01]
+check("영상 직후 늦게 고른 화면은 전환된 초로",
+      T.appeared_at(13, after_video) == 9.5 and T.appeared_at(10, after_video) == 9.5,
+      str(T.appeared_at(13, after_video)))
+check("슬라이드 항목이 늘어난 작은 변화는 제 시각 그대로", T.appeared_at(14, build_step) == 13.5,
+      str(T.appeared_at(14, build_step)))
 
 # 27) 자막이 잇따르면 영상 재생 구간으로 묶는다
 seq = [(10.0, [], None, "자막"), (14.0, [], None, "자막"), (18.0, [], None, "자막"),
@@ -501,6 +679,7 @@ with tempfile.TemporaryDirectory(prefix="mdcheck_", dir=T.tmp_root()) as td:
              (1180.0, "이 도표를 보시면 현금흐름이 순환합니다.", False),
              (1500.0, "안녕하세요 가상은행의 김가상입니다", False),
              (1505.0, "오늘은 현장 경험을 말씀드립니다", False),
+             (1510.2, "슬라이드가 뜨자마자 한 말입니다.", False),
              (1512.0, "영상에서 보셨듯이 현장이 중요합니다.", False),
              (2000.0, "이상한 소리가 계속됩니다.", True)]
     screens = [(1171.0, ["자본예산의 절차", "투자안 → 현금흐름 → 할인"], "1쪽", "슬라이드"),
@@ -523,6 +702,7 @@ with tempfile.TemporaryDirectory(prefix="mdcheck_", dir=T.tmp_root()) as td:
     check("영상 구간 발화에 📺", "**[00:25:00]** 📺 " in t and "**[00:25:05]** 📺 " in t,
           str([l for l in t.splitlines() if l.startswith("**[00:25:0")][:2]))
     check("영상이 끝난 뒤 교수의 말에는 📺 없음", "**[00:25:12]** 영상에서" in t)
+    check("슬라이드가 뜨자마자 시작한 말도 📺 없음", "**[00:25:10]** 슬라이드가" in t)
     check("의심 문단에 ⚠", "**[00:33:20]** ⚠ 이상한" in t)
     check("옮기지 못한 말소리 구간 표시", "**[00:40:00]** ⚠ *(여기서 12초 동안" in t)
     check("머리말에 경고 요약", "재생된 영상 1곳" in t and "흔들린 문단 1개" in t

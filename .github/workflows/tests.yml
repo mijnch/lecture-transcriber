@@ -33,7 +33,7 @@ jobs:
         run: |
           python -m pip install --dry-run --ignore-installed --only-binary=:all: -r engine/requirements.txt
 
-      - name: 단위 검증 111개
+      - name: 단위 검증 152개
         # 모델·ffmpeg·Tesseract 없이, 몇 시간짜리 전사 없이 문단화·빠진 말소리 찾기·
         # 화면 전환 검출·OCR 판정·PDF 정합·자막 구분·산출물 형식을 확인한다.
         # 전환 검출만 numpy 가 필요하다.

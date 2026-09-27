@@ -64,7 +64,7 @@ MEDIA_EXTS = {".mp4", ".m4a", ".mp3", ".wav", ".mkv", ".mov", ".webm",
 
 # 엔진 로직 판(版). 문단화·OCR·출력 형식을 바꿀 때마다 올린다.
 # 이 값이 산출물 지문에 들어가므로, 올리면 기존 MD가 자동으로 다시 만들어진다.
-ENGINE_REV = 12
+ENGINE_REV = 15
 
 # 강의자료 PDF 연동 — 화면에서 읽은 글자는 "몇 쪽인가"를 알아내는 열쇠로만 쓰고,
 # 실을 내용은 PDF 원문을 그대로 가져온다. OCR 잡음이 사라지고 표·빈칸이 보존된다.
@@ -121,7 +121,14 @@ HALLUCINATIONS = ("시청해주셔서 감사합니다", "시청해 주셔서 감
 # 슬라이드 읽기(OCR)
 OCR_MIN_CONF = 60        # 이보다 확신이 낮은 줄은 사진 속 잡음으로 버린다
 OCR_MIN_ALNUM = 0.55     # 글자 비율이 이보다 낮으면 잡음
+OCR_BARE_CONF = 75       # 한글 낱말도 영어 낱말도 없는 줄(숫자·기호뿐)은 이만큼 확신할 때만 싣는다 —
+                         # 사진 슬라이드의 잡음('- 31 47 26 58', 'Qe 4 「')은 62~69, 진짜 숫자 표 줄은 85 이상
+MIX_PENALTY = 6          # 판본 고르기에서 글자종이 섞인 조각(굵은 한글→HAS) 하나당 깎는 점수 —
+                         # 12면 영어 줄 속 한글 이름(섞인 판본)이 숫자로 깨진 kor 판본에 졌다.
+                         # 12·8·6 은 정답 PDF 대비 정확도가 같고, 4 부터 떨어진다(실측)
 SLIDE_CROP = 0.66        # 화자가 곁들여진 화면에서 슬라이드가 차지하는 좌측 비율
+EDGE_TOUCH = 0.97        # 잘라 읽은 줄의 오른쪽 끝이 이만큼 가면 가장자리에서 잘린 줄이다
+SPEAKER_CELL = 0.05      # 슬라이드가 멈춘 동안 이만큼 자주 움직인 칸은 화자가 서 있는 곳
 SLIDE_MERGE_RATIO = 0.55  # 낱말이 이만큼 겹치면 같은 슬라이드로 본다
 SLIDE_MERGE_LOOKBACK = 3  # 직전 몇 장까지 견주어 볼지 (애니메이션 단계 대응)
 SUBTITLE_MATCH_RATIO = 0.6   # 발화와 이만큼 겹치는 짧은 화면 글자는 영상 자막
@@ -521,35 +528,92 @@ def reread_suspects(model, audio, segments, main_lang, cfg, sr=16000):
     return sorted(segments, key=lambda s: s[0]), swapped
 
 
-def split_phrases(segments):
+def reread_video_suspects(model, audio, segments, spans, foreign, cfg, sr=16000):
+    """다른 언어 영상 안에 남은 ⚠ 구간을 그 영상의 언어로 고정해 다시 읽는다.
+
+    reread_suspects 는 언어를 새로 정하는데, 음악이 깔린 짧은 조각은 교수의 언어로 판별되어
+    재독이 버려졌다 — 영어 강의 속 한국어 영상 3분이 영어 헛문장(⚠)으로 남았다(실강의).
+    그 영상이 어느 언어인지는 이미 안다(다른 언어로 읽힌 말이 있는 영상 구간). 그 안의 ⚠
+    구간만 그 언어로 읽는다 — 교수가 영상 중간에 한 말은 대개 또렷해 ⚠ 가 아니다.
+    돌려주는 값은 (새 세그먼트 목록, 바꾼 구간 [(시작, 끝, 언어)]).
+    """
+    done = []
+    for a, b in spans:
+        langs = Counter(lang for x, y, lang in foreign if x < b and a < y)
+        if not langs:
+            continue
+        lang = langs.most_common(1)[0][0]
+        for x, y in suspect_spans([s for s in segments if a <= s[0] < b]):
+            if len(done) >= REPAIR_MAX:
+                break
+            status(f"  영상 속 흔들린 말을 영상의 언어({lang})로 다시 읽는 중... [{fmt_ts(x)}]")
+            lo = max(0.0, x - GAP_PAD_SEC)
+            clip = audio[int(lo * sr):int((y + GAP_PAD_SEC) * sr)]
+            try:
+                segs = list(model.transcribe(clip, language=lang, beam_size=cfg["beam_size"],
+                                             vad_filter=True, vad_parameters=VAD_PARAMS,
+                                             word_timestamps=True, **QUALITY)[0])
+            except Exception:
+                continue
+            good = [s for s in segs if not is_suspect(s)]
+            if not segs or len(good) < 0.7 * len(segs):
+                continue
+            new = []
+            for s in good:
+                words = [w for w in segment_words(s, lo) if x - 1 <= (w[0] + w[1]) / 2 <= y + 1]
+                text = "".join(w[2] for w in words).strip()
+                if text and not any(h in text.lower().replace(" ", "")
+                                    for h in (z.replace(" ", "") for z in HALLUCINATIONS)):
+                    new.append((words[0][0], words[-1][1], text, False, words))
+            if not new:
+                continue
+            segments = [s for s in segments if not (x <= s[0] <= y and s[3])] + new
+            done.append((x, y, lang))
+    if done:
+        status("")
+        sys.stdout.write("\r")
+    return sorted(segments, key=lambda s: s[0]), done
+
+
+def split_phrases(segments, cuts=()):
     """세그먼트를 낱말 시각으로 짧은 구절로 나눈다. (시작, 끝, 글, 의심) 목록.
 
     전문용어 힌트를 넣으면 Whisper 세그먼트가 24초짜리로 뭉개진다(실측: 24개 → 7개).
     구절 단위로 나눠야 슬라이드가 바뀐 시점에서 문단을 끊을 수 있다.
+    cuts(재생 영상이 시작·끝난 시각)에서도 끊는다 — 교수가 말을 마치자마자 영상이 시작되면
+    쉼 없이 한 구절로 묶여, 영상의 첫마디가 교수의 말로 실리거나 영상 뒤 교수의 말이 📺 로
+    실렸다(실강의). 글자가 하나도 없는 구절('... ...')은 버린다.
     """
+    cuts = sorted(cuts)
     out = []
+
+    def emit(s, e, text, bad):
+        if any(ch.isalnum() for ch in text):
+            out.append((s, e, text.strip(), bad))
+
     for seg in segments:
         s, e, text, bad = seg[0], seg[1], seg[2], seg[3]
         words = seg[4] if len(seg) > 4 else None
         if not words:
             if text.strip():
-                out.append((s, e, text.strip(), bad))
+                emit(s, e, text, bad)
             continue
         cur, cs, ce = "", None, None
         for ws, we, w in words:
-            if cs is not None and ws - ce >= PHRASE_GAP_SEC and len(cur.strip()) < 3:
+            crossed = cs is not None and any(cs < c <= ws for c in cuts)
+            if cs is not None and not crossed and ws - ce >= PHRASE_GAP_SEC and len(cur.strip()) < 3:
                 # 세그먼트 앞머리의 외톨이 낱말('이 표는'의 '이')은 시각이 부정확하다 —
                 # 앞 문단에 붙지 않도록 뒤 낱말들과 한 구절로 묶고 그 시각을 쓴다
                 cs = ws
-            elif cs is not None and (ws - ce >= PHRASE_GAP_SEC or ends_sentence(cur)):
-                out.append((cs, ce, cur.strip(), bad))
+            elif cs is not None and (crossed or ws - ce >= PHRASE_GAP_SEC or ends_sentence(cur)):
+                emit(cs, ce, cur, bad)
                 cur, cs = "", None
             if cs is None:
                 cs = ws
             cur += w
             ce = we
         if cur.strip():
-            out.append((cs, ce, cur.strip(), bad))
+            emit(cs, ce, cur, bad)
     return out
 
 
@@ -577,13 +641,19 @@ def ocr_lang_options(cfg, spoken_language: str):
     읽으면 본문 오류가 사라진다. 반대로 영어 슬라이드는 'eng'가 맞다.
     그래서 섞지 않고 따로 읽어 본 뒤 고른다 — 영어 강의에도 한국어 슬라이드가 섞여
     나오므로 발화 언어로 후보를 자르지 않는다.
+
+    'kor+eng' 도 세 번째 후보로 읽는다. 한 줄에 두 언어가 섞이면 단독 판본은 어느 쪽이든
+    반대 언어를 깨뜨린다 — 한국어 슬라이드 괄호 속 영어 용어는 숫자열이 되고, 영어 슬라이드의
+    한국 이름은 기호가 됐다(실강의). 섞인 판본이 굵은 한글을 라틴으로 오인한 줄은 글자종 섞임
+    벌점으로 떨어진다(실측: 정답 PDF 대비 재현율 0.875→0.894, 영어 강의에서 한글 이름·용어가
+    든 줄 8개 복원).
     """
     want = cfg["ocr_언어"].strip()
     if want.lower() not in ("자동", "auto", ""):
         return [want]
     if not (TESSDATA_DIR / "kor.traineddata").exists():
         return ["eng"]
-    return ["kor", "eng"] if spoken_language == "ko" else ["eng", "kor"]
+    return (["kor", "eng"] if spoken_language == "ko" else ["eng", "kor"]) + ["kor+eng"]
 
 
 def script_mix_penalty(text: str) -> int:
@@ -608,6 +678,11 @@ def script_mix_penalty(text: str) -> int:
 def ocr_score(lines) -> float:
     """읽어낸 글자의 양에서 글자종 섞임(오인식)을 벌점으로 뺀 점수."""
     return sum(len(t) - script_mix_penalty(t) * 12 for t in lines)
+
+
+def bare_line(text: str) -> bool:
+    """한글 두 음절 이상의 낱말도, 영어 세 글자 이상의 낱말도 없는 줄(숫자·기호뿐)인가."""
+    return not re.search(r"[가-힣]{2}|[A-Za-z]{3}", text)
 
 
 def ocr_lines(tess: str, img: Path, langs: str):
@@ -641,7 +716,10 @@ def ocr_lines(tess: str, img: Path, langs: str):
             raise RuntimeError(f"Tesseract 결과 파일을 읽지 못했습니다 ({e})") from e
 
     order, confs, words, tops = [], defaultdict(list), defaultdict(list), defaultdict(list)
+    rights, bottoms, page_w = defaultdict(list), defaultdict(list), 0
     for row in csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE):
+        if row.get("level") == "1":
+            page_w = int(row.get("width") or 0)
         try:
             conf = float(row["conf"])
         except (ValueError, TypeError, KeyError):
@@ -655,6 +733,8 @@ def ocr_lines(tess: str, img: Path, langs: str):
             words[key].append(word)
             try:
                 tops[key].append(int(row["top"]))
+                rights[key].append(int(row["left"]) + int(row["width"]))
+                bottoms[key].append(int(row["top"]) + int(row["height"]))
             except (ValueError, TypeError, KeyError):
                 pass
 
@@ -672,9 +752,13 @@ def ocr_lines(tess: str, img: Path, langs: str):
         # '10% -> 25%', 'GDP', 'Q&A' 같은 줄이 전부 잡음으로 버려졌다.
         content = sum(ch.isalnum() or ch in OCR_SYMBOLS for ch in body)
         conf = sum(confs[key]) / len(confs[key])
-        if (conf >= OCR_MIN_CONF
+        if (conf >= (OCR_BARE_CONF if bare_line(text) else OCR_MIN_CONF)
                 and len(text) >= 2 and content / len(body) >= OCR_MIN_ALNUM):
-            out.append((min(tops[key]) if tops[key] else 0, text, conf))
+            # 넷째 값은 줄의 오른쪽 끝(이미지 폭 대비) — 잘라 읽은 가장자리에 닿았는지 본다.
+            # 다섯째 값은 줄의 아랫변 — 판본끼리 같은 줄인지 세로로 겹치는 정도로 가린다
+            right = max(rights[key]) / page_w if rights[key] and page_w else 0.0
+            top = min(tops[key]) if tops[key] else 0
+            out.append((top, text, conf, right, max(bottoms[key]) if bottoms[key] else top))
     out.sort(key=lambda x: x[0])
     return out
 
@@ -693,7 +777,7 @@ def line_score(line) -> float:
     """
     text, conf = line[1], (line[2] if len(line) > 2 else OCR_MIN_CONF)
     han = sum(1 for ch in text if "가" <= ch <= "힣")
-    return (conf - script_mix_penalty(text) * 12 + (8 if han >= 2 else 0)
+    return (conf - script_mix_penalty(text) * MIX_PENALTY + (8 if han >= 2 else 0)
             + len(text) * 0.2)
 
 
@@ -702,18 +786,31 @@ def ocr_best(tess: str, img: Path, lang_options):
 
     화면 하나를 통째로 한 언어에 맡기면, 한국어 슬라이드에 섞인 영어(출처 표기,
     'All rights reserved', 약어)가 함께 깨진다. 그래서 같은 높이에 있는 줄끼리
-    맞대어 놓고 줄마다 더 나은 쪽을 뽑는다. OCR 실행 횟수는 늘지 않는다.
+    맞대어 놓고 줄마다 더 나은 쪽을 뽑는다. 돌려주는 값은 고른 줄(ocr_lines 형식)이다.
     """
-    return merge_ocr_passes([ocr_lines(tess, img, langs) for langs in lang_options])
+    return merge_ocr_passes([ocr_lines(tess, img, langs) for langs in lang_options], full=True)
 
 
-def merge_ocr_passes(passes, tol: int = 25):
-    """여러 번 읽은 결과를 줄 높이로 맞대어, 줄마다 잘 읽힌 쪽을 남긴다."""
+def same_row(a, b, tol: int = 25) -> bool:
+    """두 판본의 줄이 같은 줄인가 — 세로로 절반 넘게 겹치면 같다(아랫변이 없으면 윗변 차이)."""
+    if len(a) > 4 and len(b) > 4 and a[4] > a[0] and b[4] > b[0]:
+        overlap = min(a[4], b[4]) - max(a[0], b[0])
+        return overlap >= 0.5 * min(a[4] - a[0], b[4] - b[0])
+    return abs(a[0] - b[0]) <= tol
+
+
+def merge_ocr_passes(passes, tol: int = 25, full: bool = False):
+    """여러 번 읽은 결과를 줄 높이로 맞대어, 줄마다 잘 읽힌 쪽을 남긴다.
+    full 이면 글자만이 아니라 고른 줄 전체(윗변, 글자, 확신도, 오른쪽 끝, 아랫변)를 돌려준다.
+
+    같은 줄인지는 세로 겹침으로 본다 — 고정된 윗변 차이(25화소)는 2배로 키운 1080p 화면의
+    큰 글자(높이 80화소 넘음)에는 좁다. 아랫변이 없는 입력은 예전처럼 윗변 차이로 본다."""
     passes = [p for p in passes if p]
+    pick = (lambda ln: ln) if full else (lambda ln: ln[1])
     if not passes:
         return []
     if len(passes) == 1:
-        return [ln[1] for ln in passes[0]]
+        return [pick(ln) for ln in passes[0]]
 
     merged, idx = [], [0] * len(passes)
     while True:
@@ -721,13 +818,63 @@ def merge_ocr_passes(passes, tol: int = 25):
                 for i in range(len(passes)) if idx[i] < len(passes[i])]
         if not live:
             return merged
-        base = min(live)[0]
+        base = passes[min(live)[1]][idx[min(live)[1]]]
         group = []
-        for top, i in live:
-            if abs(top - base) <= tol:
+        for _top, i in live:
+            if same_row(passes[i][idx[i]], base, tol):
                 group.append(passes[i][idx[i]])
                 idx[i] += 1
-        merged.append(max(group, key=line_score)[1])
+        merged.append(pick(max(group, key=line_score)))
+
+
+def extend_cut_lines(lines, wide, edge: float = EDGE_TOUCH):
+    """잘라 읽어 가장자리에서 끊긴 줄을, 넓게 읽은 판본의 같은 줄로 늘린다.
+
+    화자가 슬라이드 위에 겹쳐 선 강의는 좌측만 잘라 읽으면 화자 위쪽을 지나는 긴 줄의
+    끝이 잘렸다(실강의: 마지막 낱말이 반쯤 잘린 줄이 쪽마다 나왔다). 그렇다고
+    화면 전체를 읽으면 어두운 제목 띠가 로고 쪽 흰 바탕과 한 줄로 묶여 제목이 통째로
+    사라지고, 줄 높이로 두 판본을 섞으면 같은 줄이 두 번 들어갔다(실측: 정확도 0.87→0.82).
+    그래서 **가장자리에 닿은 줄만**, 넓은 판본에서 그 줄로 시작하면서 더 긴 줄이 있으면
+    **잘린 뒤꼬리만** 이어 붙인다 — 가장자리에 닿지 않은 줄에 로고·화자 조각이 붙는 일이 없고,
+    앞부분은 좌측 판본을 그대로 둔다(넓은 판본으로 통째로 바꾸면 그 판본의 오독이 앞부분까지
+    들어왔다). 경계에 걸려 반쯤 잘린 글자는 좌측 판본에서 틀리게 읽히므로, 두 판본이 마지막으로
+    맞는 곳부터 넓은 판본을 쓴다.
+    lines 는 잘라 읽은 줄(ocr_lines 형식), wide 는 넓게 읽은 줄의 글자 목록이다.
+    """
+    import difflib
+
+    def squash(s):
+        pos = [i for i, ch in enumerate(s) if not ch.isspace()]
+        return "".join(s[i] for i in pos), pos
+
+    out = []
+    for ln in lines:
+        text = ln[1]
+        if len(ln) > 3 and ln[3] >= edge:
+            head, head_pos = squash(text)
+            best = None
+            for cand in wide:
+                body, body_pos = squash(cand)
+                if (len(body) <= len(head)
+                        or difflib.SequenceMatcher(None, head, body[:len(head)]).ratio() < 0.7):
+                    continue
+                blocks = [m for m in difflib.SequenceMatcher(None, head, body).get_matching_blocks()
+                          if m.size >= 2]
+                if not blocks:
+                    continue
+                a_end, b_end = blocks[-1].a + blocks[-1].size, blocks[-1].b + blocks[-1].size
+                if sum(ch.isdigit() or (ch.isascii() and ch.isalpha()) or "가" <= ch <= "힣"
+                       for ch in body[b_end:]) < 2:
+                    continue                      # 더 읽힌 글자가 없거나 조각('ㅣ')뿐이다
+                if best is None or len(body) - b_end > best[0]:
+                    cut = head_pos[a_end - 1] + 1
+                    start = body_pos[b_end]
+                    glue = " " if start > 0 and cand[start - 1].isspace() else ""
+                    best = (len(body) - b_end, text[:cut] + glue + cand[start:])
+            if best:
+                text = best[1]
+        out.append(text)
+    return out
 
 
 def grab_frame(ff: str, src: Path, t: float, vf: str, png: Path) -> bool:
@@ -738,16 +885,67 @@ def grab_frame(ff: str, src: Path, t: float, vf: str, png: Path) -> bool:
     return png.exists()
 
 
-def read_screen(ff, tess, src, t, crop, png, langs):
-    """t초의 화면을 2배로 키워 읽는다(2배가 원본보다 낫고 3배와는 차이가 없다)."""
+def read_screen(ff, tess, src, t, crop, png, langs, wide=""):
+    """t초의 화면을 2배로 키워 읽는다(2배가 원본보다 낫고 3배와는 차이가 없다).
+
+    좌측만 잘라 읽었는데 가장자리에서 끊긴 줄이 있으면, 화자만 가린 넓은 화면(wide)을
+    한 번 더 읽어 그 줄을 늘린다 — 끊긴 줄이 없는 화면은 한 번만 읽는다.
+    """
     try:
         if not grab_frame(ff, src, t, f"{crop}scale=iw*2:ih*2", png):
             return []
-        return ocr_best(tess, png, langs)
+        lines = ocr_best(tess, png, langs)
+        if crop and wide and any(ln[3] >= EDGE_TOUCH for ln in lines):
+            png.unlink(missing_ok=True)
+            if grab_frame(ff, src, t, f"{wide}scale=iw*2:ih*2", png):
+                return extend_cut_lines(lines, [ln[1] for ln in ocr_best(tess, png, langs)])
+        return [ln[1] for ln in lines]
     except subprocess.TimeoutExpired:      # 한 장이 느려도 전체를 포기하지는 않는다
         return []
     finally:
         png.unlink(missing_ok=True)
+
+
+def background_gray(ff: str, src: Path, t: float) -> int:
+    """t초 화면의 배경 밝기(작게 줄인 회색 화면의 중앙값). 못 구하면 흰색."""
+    r = subprocess.run([ff, "-nostdin", "-v", "error", "-ss", f"{t:.3f}", "-i", str(src),
+                        "-frames:v", "1", "-vf", "scale=64:36,format=gray", "-f", "rawvideo", "-"],
+                       capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+    return sorted(r.stdout)[len(r.stdout) // 2] if r.stdout else 255
+
+
+def speaker_mask(calm, cut_col: int, fill: int = 255) -> str:
+    """화자가 서 있는 칸을 채워 가리는 ffmpeg 필터(없으면 빈 문자열).
+
+    calm 은 슬라이드 쪽이 멈춘 동안 칸마다 움직인 비율이다. 오른쪽에서 가장 자주 움직인
+    칸과 이어진 칸들을 화자로 보고, 줄마다 그 칸들을 상자로 덮는다 — 사각형 하나로
+    덮으면 화자 머리 옆을 지나는 줄까지 가려졌다(화자는 위가 좁고 아래가 넓다).
+    상자는 슬라이드 배경 밝기(fill)로 칠한다 — 흰색·검은색으로 칠하면 옆을 지나는 줄까지
+    더 깨져 읽혔다(합성 강의: '즉시조치한다'→'즉시조지한나', 배경색이면 정확).
+    """
+    import numpy as np
+    calm = np.asarray(calm)
+    if calm.ndim != 2 or not calm.size:
+        return ""
+    gh, gw = calm.shape
+    right = np.where(np.arange(gw) >= cut_col, calm, 0)
+    seed = np.unravel_index(int(np.argmax(right)), calm.shape)
+    if right[seed] < SPEAKER_CELL:
+        return ""
+    hot, body, todo = calm >= SPEAKER_CELL, np.zeros(calm.shape, bool), [seed]
+    while todo:
+        r, c = todo.pop()
+        if 0 <= r < gh and 0 <= c < gw and hot[r, c] and not body[r, c]:
+            body[r, c] = True
+            todo += [(r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)]
+    boxes = []
+    for r in range(gh):
+        cols = np.nonzero(body[r])[0]
+        if len(cols):
+            boxes.append(f"drawbox=x=iw*{cols[0] / gw:.4f}:y=ih*{r / gh:.4f}:"
+                         f"w=iw*{(cols[-1] + 1 - cols[0]) / gw:.4f}:h=ih*{1 / gh:.4f}:"
+                         f"color=0x{fill:02X}{fill:02X}{fill:02X}:t=fill,")
+    return "".join(boxes)
 
 
 def speaker_on_right(shares) -> bool:
@@ -770,7 +968,7 @@ def speaker_on_right(shares) -> bool:
     return right >= 0.03 and right >= 5 * left
 
 
-def pick_crop(ff, tess, src: Path, duration: float, tmp: Path, langs, pool) -> str:
+def pick_crop(ff, tess, src: Path, times, tmp: Path, langs, pool) -> str:
     """화자가 오른쪽에 있을 때, 좌측만 잘라 읽을지 정한다.
 
     화자 창이 따로 있는 녹화 강의는 잘라내야 목차·제목까지 읽히고(전체를 읽으면 제목을
@@ -780,26 +978,42 @@ def pick_crop(ff, tess, src: Path, duration: float, tmp: Path, langs, pool) -> s
 
     전체와 잘라 읽기를 통째로 견주면 안 된다 — 줄 수는 잘린 줄도 한 줄로 세고, 글자 수는
     화자 쪽 잡음이 붙어 늘고, 깨짐 판정은 글머리표(`=`)·URL 이 든 멀쩡한 줄까지 깎았다(실측).
+    times 는 슬라이드가 멈춰 있던 화면들이다 — 길이의 25·50·75% 지점을 보던 때는 그 셋이
+    재생 영상·표 화면에 걸려, 화자 무늬의 '| |'가 슬라이드 글자보다 많이 세어져 화자 쪽까지
+    읽었다(합성 강의). 띠에서 여러 화면에 되풀이되는 줄(학교 로고)은 세지 않는다.
     """
     crop = f"crop=iw*{SLIDE_CROP}:ih:0:0,"
     strip = f"crop=iw*{1 - SLIDE_CROP:.2f}:ih:iw*{SLIDE_CROP}:0,"
 
-    def sure_chars(frac, region):
-        png = tmp / f"probe_{frac}_{len(region)}.png"
+    def sure_lines(t, region):
+        png = tmp / f"probe_{t:.0f}_{len(region)}.png"
         try:
-            if not grab_frame(ff, src, duration * frac, f"{region}scale=iw*2:ih*2", png):
-                return 0
-            return max(sum(len(ln[1]) for ln in ocr_lines(tess, png, lg) if ln[2] >= 80)
-                       for lg in langs)
+            if not grab_frame(ff, src, t, f"{region}scale=iw*2:ih*2", png):
+                return []
+            reads = [[ln[1] for ln in ocr_lines(tess, png, lg) if ln[2] >= 80 and not ocr_junk(ln[1])]
+                     for lg in langs]
+            return max(reads, key=lambda ls: sum(map(len, ls)), default=[])
         except subprocess.TimeoutExpired:
-            return 0
+            return []
         finally:
             png.unlink(missing_ok=True)
-    jobs = {pool.submit(sure_chars, frac, r): r for frac in (0.25, 0.5, 0.75) for r in (crop, strip)}
-    total = Counter()
+    jobs = {pool.submit(sure_lines, t, r): r for t in times for r in (crop, strip)}
+    found = {crop: [], strip: []}
     for fut in as_completed(jobs):
-        total[jobs[fut]] += fut.result()
-    return "" if total[strip] >= 0.25 * max(total[crop], 1) else crop
+        found[jobs[fut]].append(fut.result())
+    alnum = lambda s: sum(ch.isalnum() for ch in s)
+    seen = Counter(re.sub(r"\s", "", ln) for page in found[strip] for ln in set(page))
+    strip_chars = sum(alnum(ln) for page in found[strip] for ln in page if seen[re.sub(r"\s", "", ln)] < 2)
+    crop_chars = sum(alnum(ln) for page in found[crop] for ln in page)
+    return "" if strip_chars >= 0.25 * max(crop_chars, 1) else crop
+
+
+def still_samples(picks, shares, duration, k: int = 5):
+    """자르기 판단에 쓸, 슬라이드가 멈춰 있던 화면 k개의 시각(고르게 흩어서)."""
+    still = [n for n in picks if live_share(shares, n, "crop") < 0.02]
+    if len(still) < k:
+        return [n + 1 for n in still] or [duration * f for f in (0.25, 0.5, 0.75)]
+    return [still[round(i * (len(still) - 1) / (k - 1))] + 1 for i in range(k)]
 
 
 def select_frames(frames):
@@ -812,18 +1026,18 @@ def select_frames(frames):
     화면 전체 기준과 좌측 슬라이드 영역 기준을 **한 번의 디코딩으로 함께** 고른다.
     화자는 가끔씩만 움직여 '계속 움직이는 칸'으로 걸러지지 않는다 — 실강의 44분에서
     고른 화면 322장 중 170장이 화자 쪽 변화였다. 잘라 읽기로 정해지면 좌측 기준을 쓴다.
-    돌려주는 값은 (전체 기준 고른 초, 좌측 기준 고른 초, 칸마다 움직이던 시간의 비율,
-    초마다 움직이던 비율 [(화면 전체, 좌측 슬라이드 쪽)]).
+    돌려주는 값은 (전체 기준 고른 초, 좌측 기준 고른 초, 슬라이드 쪽이 멈춘 동안 칸마다
+    움직인 비율(화자 자리), 초마다 움직이던 비율 [(화면 전체, 좌측 슬라이드 쪽)]).
     """
     import numpy as np
-    chains, prev, ema, live_sum, shares = None, None, None, None, []
+    chains, prev, ema, calm_sum, calm_n, shares = None, None, None, None, 0, []
     for n, f in frames:
         f = f.astype(np.int16)
         h, w = f.shape
         gh, gw = h // LIVE_CELL, w // LIVE_CELL
         cut = int(gw * SLIDE_CROP)
         if prev is None:
-            ema, live_sum = np.zeros((gh, gw)), np.zeros((gh, gw))
+            ema, calm_sum = np.zeros((gh, gw)), np.zeros((gh, gw))
             # 영역마다 [고른 초, 마지막으로 고른 화면, 그 초, 재확인할 초]
             chains = {k: [[n], f, n, None] for k in ("full", "left")}
             shares.append((0.0, 0.0))
@@ -834,10 +1048,12 @@ def select_frames(frames):
         a = max(LIVE_EMA, 1 / n)       # 처음 몇 초는 누적 평균 — 화자 창을 빨리 알아본다
         ema = ema * (1 - a) + moving * a
         live = ema > LIVE_ON
-        live_sum += live
         # 자막 판정용은 지수평균이 아니라 지금 이 순간의 움직임이다 — 지수평균은 영상이
         # 끝난 뒤에도 10초 넘게 남아 바로 다음 슬라이드까지 영상으로 묶었다
         shares.append((float(moving.mean()), float(moving[:, :cut].mean())))
+        if shares[-1][1] < 0.05:        # 슬라이드 쪽이 멈춘 초 — 이때 움직이는 칸이 화자다
+            calm_sum += moving
+            calm_n += 1
         for key, chain in chains.items():
             picks, last, last_n, settle_at = chain
             region = ~live if key == "full" else ~live & (np.arange(gw) < cut)
@@ -861,18 +1077,20 @@ def select_frames(frames):
         prev = f
     if chains is None:
         return [], [], None, shares
-    live_time = live_sum / max(len(shares) - 1, 1)
-    return chains["full"][0], chains["left"][0], live_time, shares
+    return chains["full"][0], chains["left"][0], calm_sum / max(calm_n, 1), shares
 
 def live_share(shares, n: int, crop: str, ahead: int = 4) -> float:
     """n초 화면이 떠 있는 동안(직후 몇 초) 화면(잘라 읽으면 슬라이드 쪽)이 움직인 비율.
 
     n초 자체는 넣지 않는다 — 슬라이드가 넘어가는 순간도 움직임으로 잡히기 때문이다.
     전환 뒤 가만히 있는 슬라이드는 0이고, 재생 중인 영상은 매초 움직인다.
+    평균이 아니라 (아래쪽) 중앙값이다 — 영상이 끝나며 슬라이드로 2초 동안 서서히 바뀌면
+    뒤의 1초가 창에 들어와 평균이 0.25가 되어, 영상 뒤 슬라이드가 '움직이는 화면'으로
+    영상에 묶였다(실강의: 교수 슬라이드 42초가 📺 로 실렸다).
     """
     k = 1 if crop else 0
-    window = [s[k] for s in shares[n + 1:n + 1 + ahead]]
-    return sum(window) / len(window) if window else 0.0
+    window = sorted(s[k] for s in shares[n + 1:n + 1 + ahead])
+    return window[(len(window) - 1) // 2] if window else 0.0
 
 
 def scan_screen_changes(ff, src: Path, tmp: Path):
@@ -903,7 +1121,7 @@ def scan_screen_changes(ff, src: Path, tmp: Path):
                 yield n, np.frombuffer(b, np.uint8).reshape(SCAN_H, SCAN_W)
                 n += 1
         try:
-            picks, picks_left, live_time, shares = select_frames(frames())
+            picks, picks_left, calm, shares = select_frames(frames())
         finally:
             p.stdout.close()
             p.wait()
@@ -911,7 +1129,7 @@ def scan_screen_changes(ff, src: Path, tmp: Path):
         detail = err.read_text(encoding="utf-8", errors="replace").strip().splitlines()
         raise RuntimeError("화면을 뽑아내지 못했습니다"
                            + (f" — {detail[-1][:160]}" if detail else ""))
-    return picks, picks_left, live_time, shares
+    return picks, picks_left, calm, shares
 
 
 def slide_key(lines):
@@ -964,29 +1182,73 @@ def extract_slides(src: Path, tmp: Path, tess: str, duration: float, langs):
     pool = ThreadPoolExecutor(OCR_WORKERS)
     try:
         status("  화면이 바뀌는 지점을 찾는 중...")
-        picks, picks_left, live_time, shares = scan_screen_changes(ff, src, shots)
+        picks, picks_left, calm, shares = scan_screen_changes(ff, src, shots)
         # 화자가 오른쪽에 있으면 화자 쪽 변화로 고른 화면은 필요 없다 — 전체를 읽더라도
         side = speaker_on_right(shares)
         if side:
             picks = picks_left
             status("  화면 영역을 정하는 중...")
-        crop = pick_crop(ff, tess, src, duration or 600, shots, langs, pool) if side else ""
-        jobs = {pool.submit(read_screen, ff, tess, src, n, crop,
-                            shots / f"f_{n:06d}.png", langs): n for n in picks}
-        found = []
+        samples = still_samples(picks, shares, duration or 600)
+        crop = pick_crop(ff, tess, src, samples, shots, langs, pool) if side else ""
+        # 잘라 읽다 끊긴 줄을 이어 읽을 넓은 화면 — 화자 자리만 슬라이드 배경색으로 가린다
+        wide = (speaker_mask(calm, int(SCAN_W // LIVE_CELL * SLIDE_CROP),
+                             background_gray(ff, src, samples[0])) if crop else "")
+        # 넘어간 직후 화면은 인코딩이 덜 선명해 짧은 제목을 놓치기도 한다(합성 강의: 어두운 띠 위
+        # 두 글자 제목이 첫 5초 동안 읽히지 않았다) — 8초 넘게 그대로인 슬라이드는 가운데쯤
+        # (최대 10초 뒤) 화면도 읽어 더 잘 읽힌 쪽을 쓴다. 늦은 화면 하나만 읽으면 거기서 다른 줄이
+        # 빠지기도 했다(합성 강의) — 프레임마다 인코딩이 달라 어느 쪽이 나을지 미리 알 수 없다.
+        # 시각은 처음 그대로다
+        mode = "crop" if side else ""
+        ordered = sorted(picks)
+        last = int(duration) if duration else len(shares)
+        later = {n: n + min(10, (m - n) // 2)
+                 for n, m in zip(ordered, ordered[1:] + [last])
+                 if m - n >= 8 and live_share(shares, n, mode) < 0.02}
+        # 재생 중인 영상의 화면(3초마다 고른다 — 실강의에서 읽을 화면의 절반 이상)은 자막을
+        # 영상 판정과 📺 블록에만 쓰므로 단독 판본 둘로만 읽고, 잘린 줄을 이어 읽지 않는다.
+        # 세 판본에 이어 읽기까지 하던 때는 화면 읽기가 rev12 의 2.5배(10분 26초)였다(실강의)
+        playing = {n for n in picks if live_share(shares, n, mode) >= SUBTITLE_LIVE}
+        jobs = {pool.submit(read_screen, ff, tess, src, at, crop, shots / f"f_{at:06d}.png",
+                            langs[:2] if n in playing else langs, "" if n in playing else wide): n
+                for n in picks for at in (n, later.get(n)) if at is not None}
+        reads = defaultdict(list)
         for i, fut in enumerate(as_completed(jobs), 1):
             status(f"  슬라이드 읽는 중... {i}/{len(jobs)}")
-            # n번째 화면은 (n-1, n] 사이에 바뀐 것이다 — 가운데 값을 시각으로 쓴다
-            found.append((max(0.0, jobs[fut] - 0.5), fut.result()))
+            reads[jobs[fut]].append(fut.result())
+        # 움직임은 화자 쪽을 뺀 슬라이드 쪽으로 잰다 (화자가 오른쪽에 있을 때)
+        motion = [s[1 if side else 0] for s in shares]
+        found = {}
+        for n, rs in reads.items():            # 같은 시각으로 모인 화면은 잘 읽힌 쪽 하나만
+            t = appeared_at(n, motion)
+            found[t] = max(rs + ([found[t]] if t in found else []), key=ocr_score)
+        found = list(found.items())
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
         status("")
         sys.stdout.write("\r")
     found.sort(key=lambda x: x[0])
-    # 움직임은 화자 쪽을 뺀 슬라이드 쪽으로 잰다 (화자가 오른쪽에 있을 때)
-    live = {max(0.0, n - 0.5): live_share(shares, n, side) for n in picks}
-    motion = [s[1 if side else 0] for s in shares]
+    live = {appeared_at(n, motion): live_share(shares, n, side) for n in picks}
     return merge_slides(found), live, motion
+
+
+def appeared_at(n: int, motion) -> float:
+    """n번째 초에 고른 화면이 실제로 뜬 시각.
+
+    n번째 화면은 (n-1, n] 사이에 바뀐 것이므로 보통 n-0.5 초다. 그런데 영상이 끝난 직후의
+    슬라이드는 영상 동안 '계속 움직이는 칸'으로 빠져 있던 영역이 비교에 다시 들어올 때(최대
+    몇 초 뒤) 골라진다 — 그 사이 화면은 멈춰 있었다. 고른 초에 아무 변화가 없었으면, 멈춤을
+    거슬러 올라가 마지막 큰 변화(전환)가 있던 초를 쓴다. 늦게 잡힌 시각이 영상 구간의 끝이
+    되어, 영상 직후 교수의 첫마디가 📺 로 실렸다(합성 강의: 2.5초).
+    """
+    if not motion or n >= len(motion) or motion[n] >= 0.02:
+        return max(0.0, n - 0.5)
+    j = n
+    while j > 0 and n - j < 6 and motion[j] < 0.02:
+        j -= 1
+    # 그 전환 직전까지 화면이 계속 움직이고 있었을 때(영상)만 — 슬라이드에 항목이 하나씩 늘어나는
+    # 작은 변화를 앞 슬라이드가 넘어간 시각으로 끌어당기지 않는다
+    was_video = sum(1 for m in motion[max(0, j - 4):j] if m >= 0.02) >= 3
+    return max(0.0, j - 0.5) if motion[j] >= 0.3 and was_video else max(0.0, n - 0.5)
 
 
 # ────────────────────────── 강의자료 PDF 연동 ──────────────────────────
@@ -1251,6 +1513,22 @@ def align_slides_to_pdf(slides, pages, labels=None):
     return out
 
 
+def ocr_junk(line: str) -> bool:
+    """그림·괘선을 읽은 잡음 줄인가.
+
+    글자가 3자 미만이고 숫자도 없는 줄('NW', '| Sy \\'), 그리고 조각이 넷 이상인데 글자·숫자가
+    두 자 넘게 붙은 조각이 30%도 안 되는 줄(표 괘선을 읽은 '1 | | | | | 1. | |.'). 숫자만
+    있는 줄('31 47 26 58')은 표 내용일 수 있어 남긴다. 한글 두 음절('정리', '목차')은 제목이다 —
+    글자 수만 세던 때는 마지막 정리 슬라이드의 제목이 잡음으로 버려졌다(합성 강의).
+    """
+    if (sum(ch.isalpha() for ch in line) < 3 and not any(ch.isdigit() for ch in line)
+            and sum("가" <= ch <= "힣" for ch in line) < 2):
+        return True
+    toks = line.split()
+    real = sum(1 for tok in toks if sum(ch.isalnum() for ch in tok) >= 2)
+    return len(toks) >= 4 and real < 0.3 * len(toks)
+
+
 def looks_garbled(s: str) -> bool:
     """읽다 만 글자인지. 차례에 올리기 전에 거른다."""
     toks = s.split()
@@ -1269,6 +1547,32 @@ def looks_garbled(s: str) -> bool:
         if re.search(r"[a-z][A-Z]", core):            # HItI 같은 뒤죽박죽 대소문자
             return True
     return False
+
+
+def clean_moving_line(line: str) -> str:
+    """움직이는 화면(영상 위 자막)에서 읽은 줄의 잡음 조각을 떼어 낸다(남을 게 없으면 빈 문자열).
+
+    배경이 요란하면 자막 줄 끝에 '<”', '“=:', 'mes es' 같은 조각이 붙는다. 예전에는 조각 하나만
+    있어도 줄 전체를 깨진 줄로 버려, 멀쩡히 읽힌 자막까지 사라져 영상을 놓쳤다(합성 강의).
+    홑자모·읽다 만 기호가 든 조각, 한글 문장 속 3자 이하 라틴 조각(그 반대도)을 뗀다.
+    """
+    toks = line.split()
+    han_line = any(sum("가" <= c <= "힣" for c in t) >= 2 for t in toks)
+    lat_line = any(sum(c.isascii() and c.isalpha() for c in t) >= 4 for t in toks)
+    keep = []
+    for tok in toks:
+        core = tok.strip(".,:;!?()[]'\"·’”“‘…")
+        if not core or any("ㄱ" <= c <= "ㅣ" for c in core) or any(c in "|\\/[]{}<>~^_=＊" for c in core):
+            continue
+        is_lat = all(c.isascii() and c.isalpha() for c in core)
+        is_han = all("가" <= c <= "힣" for c in core)
+        if (han_line and is_lat and len(core) <= 3) or (lat_line and not han_line and is_han and len(core) <= 2):
+            continue
+        if len(core) == 1 and not ("가" <= core <= "힣" or core.isdigit()):
+            continue
+        keep.append(tok)
+    text = " ".join(keep)
+    return text if sum(ch.isalpha() for ch in text) >= 3 and not looks_garbled(text) else ""
 
 
 def slide_title(lines):
@@ -1527,11 +1831,14 @@ def label_slides(slides, paragraphs, live=None):
         page = entry[2] if len(entry) > 2 else None
         moving = page is None and live.get(t, 0.0) >= SUBTITLE_LIVE
         if moving:
-            lines = [ln for ln in lines if not looks_garbled(ln)]
+            lines = [c for c in map(clean_moving_line, lines) if c]
         near = " ".join(p[1] for p in paragraphs if abs(p[0] - t) <= 25)
         # 글자 2연쇄로 견준다 — 움직이는 배경 위 자막은 OCR이 깨져 낱말로는 겹치지 않는다
         sw, nw = page_key(" ".join(lines)), page_key(near)
-        ratio = len(sw & nw) / len(sw) if sw else 0.0
+        # 2연쇄가 몇 개뿐인 조각('se an')은 발화와 우연히 겹친다(합성 강의: 영어 발화의 'response'
+        # 에 전부 들어 있었다) — 근거로 삼으려면 여섯 개는 있어야 한다. 짧은 진짜 자막은 옆 자막
+        # 화면에 잇닿아 있으면 아래에서 같은 영상으로 묶인다
+        ratio = len(sw & nw) / len(sw) if len(sw) >= 6 else 0.0
         short = len(lines) <= 3 and sum(len(x) for x in lines) <= 90
         info.append((t, lines, page, moving, moving and short and ratio >= SUBTITLE_MATCH_RATIO))
     kinds = ["자막" if x[4] else "슬라이드" for x in info]
@@ -1584,37 +1891,72 @@ def screen_ends(screens, duration):
     return order, ends
 
 
-VIDEO_URL = re.compile(r"youtu|watch\?v=|vimeo|tv\.naver|naver\.me|tvcast|dailymotion", re.I)
+# 영상 출처 표시 — 주소, 그리고 참고문헌 표기의 '[video file]'·'[동영상]'(주소가 줄 끝에서 잘려도 남는다)
+VIDEO_URL = re.compile(r"youtu|watch\?v=|vimeo|tv\.naver|naver\.me|tvcast|dailymotion"
+                       r"|\[\s*video(?: file)?\s*\]|\[\s*(?:동영상|영상)\s*\]", re.I)
 
 
-def motion_video_spans(motion, screens, win=20):
-    """슬라이드 쪽이 오래·크게 움직이고, 그 무렵 화면에 영상 출처 주소가 있으면 재생 영상이다.
+def other_script(text: str, lang: str) -> bool:
+    """글이 강의 언어와 다른 문자로 쓰였는가 — 영어 강의 속 한글, 한국어 강의 속 영어 문장."""
+    han = sum("가" <= c <= "힣" for c in text)
+    lat = sum(c.isascii() and c.isalpha() for c in text)
+    return (lang == "en" and han >= 6 and han > lat) or (lang == "ko" and lat >= 20 and lat > 3 * han)
+
+
+def motion_video_spans(motion, screens, win=20, lang=None):
+    """슬라이드 쪽이 오래·크게 움직이고, 그 무렵 영상이라는 표시가 화면에 있으면 재생 영상이다.
 
     자막 글자도 없고 교수와 같은 언어인 영상(인터뷰 등)은 앞의 두 근거로는 못 찾는다
     (실강의: 94초 중 73초가 움직인 인터뷰가 교수의 말로 실렸다 — 보통 슬라이드는 70초 중 1초).
     움직임만 믿으면 판서·반복 애니메이션까지 영상이 되어 교수의 말이 📺 가 되므로 셋을 함께 본다:
-      · 20초 동안 60% 넘는 초가 움직이고 평균 움직임이 0.08 이상(판서는 가는 선이라 훨씬 작다)
-      · 그 구간이나 직전 15초에 뜬 화면에 영상 출처 주소(youtube 등)가 적혀 있다
+      · 20초 넘게 움직임이 이어지고(4초 이하의 멈춤은 잇는다) 그중 60% 넘는 초가 움직이며
+        평균 움직임이 0.08 이상(판서는 가는 선이라 훨씬 작다)
+      · 그 구간이나 직전 30초에 뜬 화면에 영상 출처(youtube 주소, [video file] 표기)가 있거나,
+        그 구간의 짧은 화면 글자가 2장 이상 강의 언어와 다른 문자다 — 영어 강의에서 튼
+        영어 인터뷰의 한글 자막(실강의: 말도 교수와 같은 영어라 언어 근거가 없었다)
       · 강의의 40% 이상이 정지 슬라이드다 — 카메라만 비추는 강의는 움직임으로 가를 수 없다
+    예전에는 20초 창을 밀며 보아서, 두 영상 사이에 7초 뜬 교수 슬라이드와 그 설명까지, 그리고
+    영상 앞 슬라이드가 넘어간 순간(한 초의 움직임)부터 영상으로 묶였다(합성 강의).
     """
     if not motion or sum(1 for m in motion if m < 0.05) < 0.4 * len(motion):
         return []
-    hot = [False] * len(motion)
-    for s in range(len(motion) - win + 1):
-        w = motion[s:s + win]
-        if sum(1 for m in w if m > 0.02) >= 0.6 * win and sum(w) / win >= 0.08:
-            hot[s:s + win] = [True] * win
-    spans, start = [], None
-    for n, h in enumerate(hot + [False]):
-        if h and start is None:
-            start = n
-        elif not h and start is not None:
-            # 20초 창은 실제 움직임보다 앞뒤로 넓다 — 실제로 움직인 첫 초와 마지막 초로 다듬는다
-            moved = [k for k in range(start, n) if motion[k] > 0.02]
-            spans.append((max(0.0, moved[0] - 0.5), moved[-1] + 0.5))
-            start = None
-    return [(a, b) for a, b in spans
-            if any(VIDEO_URL.search(" ".join(sc[1])) for sc in screens if a - 15 <= sc[0] < b)]
+    runs, first, last = [], None, None
+    for n, m in enumerate(list(motion) + [0.0] * 6):
+        if m > 0.02:
+            if first is None:
+                first = n
+            last = n
+        elif first is not None and n - last > 4:
+            runs.append((first, last))
+            first = None
+    def video_like(k, w):
+        return motion[k] >= 0.08 and sum(1 for m in w if m > 0.02) >= 4 and sum(w) / len(w) >= 0.08
+
+    spans = []
+    for s, e in runs:
+        # 앞뒤에 이어 붙은 슬라이드 넘김·커서 움직임은 뗀다 — 영상다운 움직임(0.08 이상이 5초 중
+        # 4초)이 시작된 초와 끝난 초로 다듬는다(실강의: 영상 직전 교수의 말 4초, 교수가 기사를 읽는
+        # 12초가 커서 움직임과 이어져 📺 가 됐다)
+        starts = [k for k in range(s, e + 1) if video_like(k, motion[k:k + 5])]
+        ends = [k for k in range(s, e + 1) if video_like(k, motion[max(0, k - 4):k + 1])]
+        if not starts or not ends or ends[-1] <= starts[0]:
+            continue
+        s, e = starts[0], ends[-1]
+        seconds = motion[s:e + 1]
+        if (len(seconds) >= win and sum(1 for m in seconds if m > 0.02) >= 0.6 * len(seconds)
+                and sum(seconds) / len(seconds) >= 0.08):
+            spans.append((max(0.0, s - 0.5), e + 0.5))
+
+    def cue(a, b):
+        # 출처 슬라이드는 영상 30초 전쯤 뜨기도 한다 — 교수가 대본 슬라이드 몇 장을 먼저 보여 준
+        # 뒤 영상을 틀었다(실강의: 26초 전). 예전의 20초 창은 시작을 앞당겨 우연히 잡았었다
+        near = [sc for sc in screens if a - 30 <= sc[0] < b]
+        if any(VIDEO_URL.search(" ".join(sc[1])) for sc in near):
+            return True
+        subs = [sc for sc in near if a <= sc[0] and not sc[2] and 0 < len(sc[1]) <= 3
+                and other_script(" ".join(sc[1]), lang)]
+        return bool(lang) and len(subs) >= 2
+    return [(a, b) for a, b in spans if cue(a, b)]
 
 
 def mark_video(spans, screens, extra):
@@ -1637,13 +1979,26 @@ def add_language_spans(spans, screens, swapped, motion):
 
     교수의 말과 언어가 다르고 화면이 움직인다 — 자막 글자가 없어도(뉴스 화면 등)
     재생된 영상이라고 볼 근거가 충분하다. 그 사이의 화면은 영상 화면으로 묶는다.
+    시작은 화면이 계속 움직이기 시작한 초로 당긴다 — 영어 강의의 교수가 슬라이드의 한국어
+    기사를 소리 내 읽은 뒤 영상을 틀면, 읽은 대목부터 영상으로 묶였다(실강의 12초).
     """
     moving = lambda a, b: (lambda s: bool(s) and sum(s) / len(s) >= SUBTITLE_LIVE)(
         motion[int(a):int(b) + 1])
+
+    def settled_start(a, b):
+        # 영상다운 움직임(0.08 이상)이어야 한다 — 교수의 커서·판서(0.03~0.05)가 이어진 초를
+        # 영상 시작으로 잡아, 기사를 읽는 교수의 말이 여전히 📺 가 됐다(실강의)
+        for k in range(int(a), int(b) + 1):
+            w = motion[k:k + 5]
+            if motion[k] >= 0.08 and sum(1 for m in w if m > 0.02) >= 4 and sum(w) / len(w) >= 0.08:
+                return max(a, k - 0.5)
+        return a
+
     extra = []
     for a, b, _lang in sorted(swapped):
         if not moving(a, b):
             continue
+        a = settled_start(a, b)
         # 사이가 1분 이내이고 그동안에도 화면이 움직였으면 같은 영상이다 — 그 사이에는 영상 속
         # 노래나, 교수 언어로 '번역'되어 ⚠ 없이 남은 말이 있다(실강의). 교수의 말로 읽히면 안 된다.
         if extra and a - extra[-1][1] <= 60 and moving(extra[-1][1], a):
@@ -1658,19 +2013,26 @@ def foreign_spans(segments, main_lang):
 
     재독으로 바뀐 구간만 보면, 처음부터 그 언어로 옮겨진 첫 문장(뉴스 앵커의 첫마디)이
     빠져 영상 구간이 2초 늦게 시작됐다(실강의). 한국어 강의의 영어는 용어가 흔하므로
-    영어가 압도적인 긴 문장만 센다.
+    영어가 압도적인 긴 문장만 센다. 구간은 세그먼트가 아니라 **그 문자로 된 낱말**이 있는 곳까지다
+    — 영어 세그먼트 하나가 영상 직후 교수의 한국어 첫마디까지 품어, 그 말이 📺 가 됐다(합성 강의).
     """
+    def foreign_word(w):
+        han = any("가" <= c <= "힣" for c in w)
+        lat = any(c.isascii() and c.isalpha() for c in w)
+        return han and not lat if main_lang == "en" else lat and not han
+
     out = []
     for s in segments:
-        han = sum("가" <= c <= "힣" for c in s[2])
-        lat = sum(c.isascii() and c.isalpha() for c in s[2])
-        if not ((main_lang == "en" and han >= 6 and han > lat)
-                or (main_lang == "ko" and lat >= 20 and lat > 3 * han)):
+        if not other_script(s[2], main_lang):
             continue
-        if out and s[0] - out[-1][1] <= GAP_JOIN_SEC:
-            out[-1] = (out[-1][0], max(out[-1][1], s[1]), out[-1][2])
+        a, b = s[0], s[1]
+        words = [w for w in (s[4] if len(s) > 4 and s[4] else []) if foreign_word(w[2])]
+        if words:
+            a, b = words[0][0], words[-1][1]
+        if out and a - out[-1][1] <= GAP_JOIN_SEC:
+            out[-1] = (out[-1][0], max(out[-1][1], b), out[-1][2])
         else:
-            out.append((s[0], s[1], "ko" if main_lang == "en" else "en"))
+            out.append((a, b, "ko" if main_lang == "en" else "en"))
     return out
 
 
@@ -1707,6 +2069,56 @@ def join_video_spans(spans, screens, foreign=(), phrases=(), max_gap=VIDEO_JOIN_
     return joined, screens
 
 
+def trim_still_tail(spans, screens, motion, duration):
+    """재생 영상 구간의 꼬리에 붙은 멈춘 화면을 떼어 낸다.
+
+    영상이 끝나고 슬라이드로 서서히 넘어가는 전환은 움직임으로 잡혀, 그 뒤 슬라이드가 영상
+    화면으로 묶이고 구간이 그 슬라이드가 내려갈 때까지 늘어났다(실강의: 교수가 슬라이드를
+    설명한 42초가 📺 로 실렸다). 구간 끝에 있는 화면이 뜬 뒤(전환 2초 제외) 3초 넘게 전혀
+    움직이지 않았으면 영상이 아니다 — 구간을 그 화면이 뜬 때에서 끝낸다. 강의자료 쪽이면
+    움직임과 상관없이 교수의 슬라이드다. 영상 속 정지 글자 카드는 구간 끝에 오지 않는 한
+    그대로 둔다.
+    """
+    order, ends = screen_ends(screens, duration)
+
+    def still(i):
+        if screens[i][2]:
+            return True
+        # n초에 뜬 화면(t = n - 0.5)은 n+1초까지 전환이 이어질 수 있고, 다음 화면의 전환도
+        # 1초 앞서 시작될 수 있다 — 그 사이만 본다. '전혀 안 움직임'을 요구하면 교수가 판서하거나
+        # 커서를 움직인 몇 초(0.03~0.7) 때문에 영상 뒤 슬라이드를 떼지 못했다(실강의) — 영상처럼
+        # 움직인(0.05 초과) 초가 20% 이하면 멈춘 화면이다
+        seconds = motion[int(screens[i][0]) + 3:int(ends[i])]
+        return len(seconds) >= 3 and sum(1 for m in seconds if m > 0.05) <= 0.2 * len(seconds)
+
+    def frozen_since(a, b):
+        """구간 끝까지 3초 넘게 완전히 멈춰 있고 그 직전에 전환(0.3 이상)이 있었으면 그 전환 시각.
+        영상이 끝나 마지막 화면이 멈춘 채 다음 슬라이드가 몇 초 뒤에 뜨면, 그 사이 교수의 말이
+        📺 로 실렸다(실강의: 5초). 글자가 없는 멈춘 화면은 화면 목록에 없어 위 규칙으로 못 뗀다."""
+        k = min(int(b), len(motion)) - 1
+        quiet = 0
+        while k > a and motion[k] <= 0.02:
+            k, quiet = k - 1, quiet + 1
+        return k - 0.5 if quiet >= 3 and k > a and motion[k] >= 0.3 else None
+
+    out, cut = [], []
+    for a, b in spans:
+        tail = [i for i in order if a < screens[i][0] < b]
+        while tail and still(tail[-1]):
+            i = tail.pop()
+            cut.append((screens[i][0], b))
+            b = screens[i][0]
+        end = frozen_since(a, b) if motion else None
+        if end is not None:
+            cut.append((end, b))
+            b = end
+        if b > a:
+            out.append((a, b))
+    screens = [(t, lines, page, "슬라이드" if kind == "자막" and any(x <= t < y for x, y in cut)
+                else kind) for t, lines, page, kind in screens]
+    return out, screens
+
+
 def write_markdown(out_path: Path, src: Path, info, paragraphs, cfg, screens=(),
                    pdf_name=None, pdf_tag=None, vad_lost=0.0, repaired=(), lost=(), spans=None):
     """screens 는 label_slides 가 돌려준 (시각, 줄, 쪽, 종류) 목록이다.
@@ -1722,8 +2134,9 @@ def write_markdown(out_path: Path, src: Path, info, paragraphs, cfg, screens=(),
     def in_video(t):
         # 영상의 시작(움직임이 시작된 초)과 끝(다음 화면이 뜬 때)을 알므로 여유는 거의
         # 없어도 된다. 예전의 앞뒤 15초 여유는 영상 직후 교수가 "영상에서 보셨듯이…"
-        # 라고 한 말까지 교수의 말이 아니라고 표시했다.
-        return any(a - 0.5 <= t < b + 0.5 for a, b in spans)
+        # 라고 한 말까지 교수의 말이 아니라고 표시했다. 끝에는 여유를 두지 않는다 —
+        # 0.5초 여유만으로도 슬라이드가 뜨자마자 시작한 교수의 말이 📺 가 되었다(실강의).
+        return any(a - 0.5 <= t < b for a, b in spans)
 
     course, week, period = parse_course(src.stem)
     lines = ["---", f"과목: {course}"]
@@ -1869,6 +2282,7 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
     # 전문용어만 음성 인식 힌트로 넘기기 위해서다(다른 과목 자료의 용어가 섞이면 안 된다).
     loaded, pdf_all = load_slide_materials(src)
     slides, live, motion = [], {}, []
+    t_screen = time.monotonic()
     if cfg["슬라이드_읽기"] and tess and media["video"]:
         try:
             # 발화 언어는 아직 모르지만, 순서는 두 판본의 점수가 똑같을 때만 영향을 준다
@@ -1881,6 +2295,7 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
             # print만 하면 창을 닫은 뒤 흔적이 없다. 기록에 남겨 사후 진단이 되게 한다.
             log(f"  ⚠ 슬라이드를 읽지 못했습니다: {out_path.name} — {e}"
                 f" (음성 전사는 정상 저장)")
+    screen_sec = time.monotonic() - t_screen
 
     chosen = pick_materials(slides, loaded)
     pdf_used = [m.name for m, _t in chosen]
@@ -1925,20 +2340,17 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
         print(f"  처음 인식에서 빠진 말소리 {len(repaired)}곳을 다시 읽어 채웠습니다.")
     collected = sorted(collected + added, key=lambda s: s[0])
     repaired = sorted(repaired + [(a, b) for a, b, _l in swapped])
-    del audio
-    elapsed = time.monotonic() - t0
 
     phrases = split_phrases(collected)
     if not phrases:
         raise RuntimeError("음성이 감지되지 않았습니다 (오디오 트랙이 없거나 무음일 수 있습니다)")
 
     # 화면에서 읽은 글자에도 되풀이되는 배너가 있으면 뺀다 (PDF 쪽은 이미 뺐다).
-    # 그림 화면에서 나온 잡음 줄('NW', '| Sy \')도 뺀다 — 글자 3자 미만에 숫자도 없는 줄.
+    # 그림 화면에서 나온 잡음 줄('NW', '| Sy \')도 뺀다 — 글자 3자 미만에 숫자도 없는 줄,
+    # 그리고 표 괘선을 읽은 줄('1 | | | | 1. | |')처럼 낱말다운 조각이 거의 없는 줄.
     # 숫자만 있는 줄은 표 내용일 수 있어 남긴다.
     ocr_only = [i for i, s in enumerate(slides) if len(s) < 3 or not s[2]]
-    cleaned = drop_boilerplate([[ln for ln in slides[i][1]
-                                 if sum(ch.isalpha() for ch in ln) >= 3 or any(ch.isdigit() for ch in ln)]
-                                for i in ocr_only])
+    cleaned = drop_boilerplate([[ln for ln in slides[i][1] if not ocr_junk(ln)] for i in ocr_only])
     for i, body in zip(ocr_only, cleaned):
         slides[i] = (slides[i][0], body) + tuple(slides[i][2:])
     slides = [s for s in slides if s[1]]
@@ -1948,11 +2360,22 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
     spans = video_spans([screens[i] for i in order], [ends[i] for i in order], motion)
     foreign = sorted(set(swapped) | set(foreign_spans(collected, info.language)))
     spans, screens = add_language_spans(spans, screens, foreign, motion)
-    spans, screens = mark_video(spans, screens, motion_video_spans(motion, screens))
+    spans, screens = mark_video(spans, screens, motion_video_spans(motion, screens, lang=info.language))
     spans, screens = join_video_spans(spans, screens, foreign, phrases)
-    # 슬라이드가 바뀐 때와 영상이 시작된 때 문단을 끊는다
-    paragraphs = group_paragraphs(phrases, [s[0] for s in screens if s[3] == "슬라이드"]
-                                  + [a for a, _b in spans])
+    spans, screens = trim_still_tail(spans, screens, motion, info.duration)
+
+    # 다른 언어 영상 안에 남은 ⚠ 를 그 언어로 다시 읽는다
+    collected, forced = reread_video_suspects(model, audio, collected, spans, foreign, cfg)
+    if forced:
+        print(f"  영상 속 흔들린 말 {len(forced)}곳을 영상의 언어로 다시 읽었습니다.")
+        repaired = sorted(repaired + [(a, b) for a, b, _l in forced])
+    del audio
+    elapsed = time.monotonic() - t0
+
+    # 슬라이드가 바뀐 때와 영상이 시작·끝난 때 문단을 끊는다 — 구절도 그 시각에서 나눈다
+    cuts = [a - 0.5 for a, _b in spans] + [b for _a, b in spans]
+    phrases = split_phrases(collected, cuts)
+    paragraphs = group_paragraphs(phrases, [s[0] for s in screens if s[3] == "슬라이드"] + cuts)
     vad_lost = 1 - (getattr(info, "duration_after_vad", info.duration) / total)
     write_markdown(out_path, src, info, paragraphs, cfg, screens,
                    ", ".join(pdf_used) if pdf_used else None, ", ".join(pdf_all),
@@ -1960,7 +2383,7 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
     speed = info.duration / elapsed if elapsed > 0 else 0
     log(f"  ✔ 완료: {out_path.name} (전사 {fmt_ts(elapsed)}, 실시간 대비 {speed:.1f}배"
         + (f", 복구 {len(repaired)}곳" if repaired else "")
-        + (f", 슬라이드 {len(screens)}장" if screens else "") + ")")
+        + (f", 슬라이드 {len(screens)}장 · 화면 읽기 {fmt_ts(screen_sec)}" if screens else "") + ")")
 
 
 def cleanup_stale_temp():
