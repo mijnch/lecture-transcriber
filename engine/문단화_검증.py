@@ -119,6 +119,76 @@ check("가까운 빈틈은 한 번에 다시 읽음",
       [(round(a, 1), round(b, 1)) for a, b in gaps] == [(4.3, 12.7)], str(gaps))
 check("낱말이 다 덮으면 빈틈 없음", T.find_gaps([(0, 10)], [(0, 5), (5, 10)]) == [])
 
+# 13-2) ⚠ 구간 묶기 — 다른 언어로 말한 대목이 환각으로 채워진 곳을 다시 읽기 위해
+segs = [(0, 5, "정상", False), (5, 9, "환각1", True), (10, 14, "환각2", True),
+        (20, 21, "짧은 의심", True), (30, 40, "정상", False)]
+check("⚠ 구간 묶기 (가까운 것끼리, 짧은 것은 제외)", T.suspect_spans(segs) == [(5, 14)],
+      str(T.suspect_spans(segs)))
+# 13-3) 다른 언어로 다시 읽힌 구간에서 화면이 움직였으면 재생 영상 — 그 사이 화면도 영상으로
+scr = [(100.0, ["뉴스 스튜디오"], None, "슬라이드"), (130.0, ["요약"], "3쪽", "슬라이드"),
+       (200.0, ["다음 슬라이드"], None, "슬라이드")]
+motion = [0.8 if 95 <= n <= 160 else 0.0 for n in range(300)]
+sp, sc = T.add_language_spans([], scr, [(96.0, 160.0, "ko"), (250.0, 280.0, "ko")], motion)
+check("언어가 바뀌고 화면이 움직인 구간은 영상", sp == [(96.0, 160.0)], str(sp))
+check("그 사이 화면은 영상 화면으로 (PDF 쪽은 제외)",
+      [k for *_x, k in sc] == ["자막", "슬라이드", "슬라이드"], str([k for *_x, k in sc]))
+sp, _sc = T.add_language_spans([], scr, [(96.0, 110.0, "ko"), (150.0, 160.0, "ko")], motion)
+check("영상이 계속 움직였으면 사이의 번역·노래 구간도 같은 영상", sp == [(96.0, 160.0)], str(sp))
+still = [0.8 if 95 <= n <= 111 or 149 <= n <= 160 else 0.0 for n in range(300)]
+sp, _sc = T.add_language_spans([], scr, [(96.0, 110.0, "ko"), (150.0, 160.0, "ko")], still)
+check("사이에 화면이 멈췄으면 따로", sp == [(96.0, 110.0), (150.0, 160.0)], str(sp))
+
+# 13-4) 오른쪽 화자 판정 — 슬라이드 쪽이 멈춘 동안 오른쪽이 움직여야 화자다.
+#       전체 화면 영상이 재생되면 좌우가 함께 움직이므로 그 시간은 빼고 본다.
+gw, cut = T.SCAN_W // T.LIVE_CELL, int(T.SCAN_W // T.LIVE_CELL * T.SLIDE_CROP)
+def mix(right, left):          # 오른쪽·왼쪽 움직임 → (화면 전체, 좌측) 비율
+    return ((right * (gw - cut) + left * cut) / gw, left)
+split = [(0.0, 0.0)] + [mix(0.25, 0.0)] * 200 + [mix(0.6, 0.6)] * 200      # 좌우 분할 + 긴 영상
+full = [(0.0, 0.0)] + [mix(0.0, 0.0)] * 300 + [mix(0.5, 0.5)] * 60          # 전체 화면 슬라이드 + 영상
+check("영상을 오래 틀어도 좌우 분할 화자를 알아봄", T.speaker_on_right(split) is True)
+check("전체 화면 영상은 화자로 보지 않음(자르지 않음)", T.speaker_on_right(full) is False)
+check("판단할 만큼 멈춘 시간이 없으면 자르지 않음", T.speaker_on_right([mix(0.5, 0.5)] * 300) is False)
+# 13-5) 교수와 다른 문자로 옮겨진 구간 — 영어 강의 속 한글 문장은 근거, 한국어 강의 속 용어는 아님
+fs = T.foreign_spans([(0, 3, "Let me show you a clip.", False), (4, 8, "가상 스튜디오에 지금 비가 많이 옵니다", False),
+                      (9, 12, "현장 연결이 잠시 끊겼습니다", False), (30, 33, "That was the anchor.", False)], "en")
+check("영어 강의 속 한글 문장 구간", fs == [(4, 12, "ko")], str(fs))
+check("한국어 강의 속 짧은 영어 용어는 근거가 아님",
+      T.foreign_spans([(0, 3, "이것이 Supply Chain 입니다", False)], "ko") == [])
+
+# 13-6) 영상 속 정지 글자 카드로 끊긴 구간은 잇되, 교수가 돌아온 틈은 잇지 않는다
+scr = [(100.0, ["a"], None, "자막"), (131.0, ["정지 카드"], None, "슬라이드"), (140.0, ["b"], None, "자막"),
+       (300.0, ["c"], None, "자막"), (320.0, ["강의 슬라이드"], "5쪽", "슬라이드"), (330.0, ["d"], None, "자막")]
+sp, sc = T.join_video_spans([(100.0, 130.0), (140.0, 170.0), (300.0, 315.0), (330.0, 340.0)], scr)
+check("정지 카드 틈은 같은 영상으로 잇기", sp[0] == (100.0, 170.0) and sc[1][3] == "자막", f"{sp} {sc[1][3]}")
+check("틈에 강의자료 쪽이 뜨면 잇지 않음", (300.0, 315.0) in sp and (330.0, 340.0) in sp, str(sp))
+sp, _sc = T.join_video_spans([(100.0, 130.0), (148.0, 170.0)], scr[:1],
+                             foreign=[(100.0, 130.0, "ko"), (148.0, 170.0, "ko")],
+                             phrases=[(135.0, 140.0, "That was a famous clip.", False)])
+check("다른 언어 영상 사이에 교수가 논평하면 잇지 않음", sp == [(100.0, 130.0), (148.0, 170.0)], str(sp))
+
+# 13-7) 자막도 언어 차이도 없는 영상 — 오래·크게 움직이고 출처 주소가 있으면 영상
+talk = [0.0] * 600
+for n in range(300, 394):
+    talk[n] = 0.14 if n % 5 else 0.0          # 94초 중 약 80%가 움직이는 인터뷰
+url = [(290.0, ["출처: https://www.youtube.com/watch?v=abc"], None, "슬라이드"),
+       (400.0, ["다음 슬라이드"], None, "슬라이드")]
+mv = T.motion_video_spans(talk, url)
+check("움직임 + 출처 주소 = 재생 영상", len(mv) == 1 and 295 <= mv[0][0] <= 305 and mv[0][1] >= 390, str(mv))
+check("출처 주소가 없으면 움직임만으로는 영상이 아님",
+      T.motion_video_spans(talk, [(290.0, ["사진 설명"], None, "슬라이드")]) == [])
+pen = [0.03 if 300 <= n < 400 else 0.0 for n in range(600)]    # 판서는 가는 선이라 움직임이 작다
+check("판서 수준의 움직임은 영상이 아님", T.motion_video_spans(pen, url) == [])
+cam = [0.2] * 600                                               # 카메라만 비추는 강의
+check("정지 슬라이드가 거의 없는 강의는 움직임으로 가르지 않음", T.motion_video_spans(cam, url) == [])
+# 13-8) 영상 속 글자 카드가 32초 동안 4장 — 30초를 넘어도 같은 영상으로 잇는다
+cards = [(100.0, ["a"], None, "자막"), (131.0, ["카드1"], None, "슬라이드"), (134.0, ["카드2"], None, "슬라이드"),
+         (137.0, ["카드3"], None, "슬라이드"), (150.0, ["카드4"], None, "슬라이드"), (163.0, ["b"], None, "자막")]
+sp, _sc = T.join_video_spans([(100.0, 131.0), (163.0, 200.0)], cards)
+check("빠르게 바뀌는 글자 카드 틈은 이음", sp == [(100.0, 200.0)], str(sp))
+slow = [(100.0, ["a"], None, "자막"), (131.0, ["교수 슬라이드"], None, "슬라이드"), (180.0, ["b"], None, "자막")]
+sp, _sc = T.join_video_spans([(100.0, 131.0), (180.0, 200.0)], slow)
+check("한 장이 오래 뜬 틈(교수 슬라이드)은 잇지 않음", sp == [(100.0, 131.0), (180.0, 200.0)], str(sp))
+
 print("\n신뢰할 수 없는 구간 표식")
 
 # 14) 세그먼트의 의심 표식이 문단까지 전달된다
@@ -216,13 +286,24 @@ if np is not None:
                 g[:, :210] = rng.integers(0, 255, (240, 210))
             yield n, g
 
-    picks, _live, _shares = T.select_frames(frames(60, change_at=(10, 30)))
+    picks, _left, _live, _shares = T.select_frames(frames(60, change_at=(10, 30)))
     check("글자 한 줄 늘어난 전환을 잡음", picks == [0, 10, 30], str(picks))
-    picks, live_time, _ = T.select_frames(frames(60, change_at=(20, 40), moving=(0, 240, 220, 320)))
+    picks, _left, live_time, _ = T.select_frames(frames(60, change_at=(20, 40), moving=(0, 240, 220, 320)))
     check("움직이는 화자 창은 무시하고 전환만 잡음",
           20 in picks and 40 in picks and len([p for p in picks if p > 5]) == 2, str(picks))
     check("화자 창 쪽이 움직였다고 기록", live_time[:, 14:].mean() > 0.5 > live_time[:, :12].mean())
-    picks, _l, shares = T.select_frames(frames(60, change_at=(5,), video=((20, 40),)))
+
+    def fidget(total, change_at):
+        """화자가 가끔씩만 움직인다 — '계속 움직이는 칸'으로는 걸러지지 않는다."""
+        for n, g in frames(total, change_at):
+            if n % 9 == 0 and n:
+                g = g.copy()
+                g[60:200, 240:300] = 40 + (n * 37) % 180
+            yield n, g
+    full, left, _lt, _s = T.select_frames(fidget(60, (20, 40)))
+    check("가끔 움직이는 화자는 좌측 기준에서 무시",
+          left == [0, 20, 40] and len(full) > len(left), f"전체 {full} / 좌측 {left}")
+    picks, _left, _l, shares = T.select_frames(frames(60, change_at=(5,), video=((20, 40),)))
     vids = [p for p in picks if 20 <= p < 40]
     check("영상 재생 중에는 촘촘히 봄", len(vids) >= 5, str(vids))
     check("정지 슬라이드는 움직임 0",
@@ -312,6 +393,33 @@ check("되풀이되는 배너 제거", all("S A M P L E" not in " ".join(p) for 
       and clean[0][0] == "0번째 쪽 제목", str(clean[0]))
 check("절반만 나오는 줄은 유지", sum("공통 아님" in p for p in clean) == 3)
 check("쪽이 적으면 건드리지 않음", drop_boilerplate(pages[:3]) == pages[:3])
+
+# 33-2) 이름에 과목이 없는 LMS 자료(주차만 같은 후보)는 화면과 맞춰 본 뒤 채택한다
+M = T.Material
+book = [f"표본추출 {k}장\n모집단 표집틀 추정값 비표본오차 무응답 {k}번째 내용 설명" for k in range(1, 6)]
+book[1] = "좋은 설문의 조건\n질문을 짧게 쓴다 유도 질문을 피한다 응답 선택지를 겹치지 않게"
+sheet = ["실습지 층화추출 연습 문제 층별 표본 크기 배분 계산하기"]
+other = ["재무제표의 구성 대차대조표 손익계산서 현금흐름표 자본변동표 주석",
+         "유동비율 부채비율 자기자본이익률 총자산회전율 계산과 해석"]
+loaded = [(M("묶음.zip/7주차교재.pdf", "7주차교재", 7, False, "묶음.zip", None), book),
+          (M("묶음.zip/7실습지.pdf", "7실습지", 7, False, "묶음.zip", None), sheet),
+          (M("다른과목 7주차.pdf", "다른과목 7주차", 7, False, "폴더", None), other),
+          (M("표본통계학 보충.pdf", "표본통계학 보충", None, True, "폴더", None), ["보충 자료 쪽"])]
+seen = [(10.0, ["표본추출 1장 모집단 표집틀 추정값 비표본오차"]),
+        (60.0, ["좋은 설문의 조건 질문을 짧게 쓴다 유도 질문"]),
+        (90.0, ["실습지 층화추출 연습 문제 층별 표본 크기 배분"]),
+        (120.0, ["표본추출 3장 모집단 표집틀 추정값 무응답"])]
+picked = [m.name for m, _t in T.pick_materials(seen, loaded)]
+check("주차만 같은 자료는 화면과 맞을 때만 채택",
+      picked == ["묶음.zip/7주차교재.pdf", "묶음.zip/7실습지.pdf", "표본통계학 보충.pdf"], str(picked))
+check("화면을 못 읽었으면 이름에 강의가 적힌 자료만",
+      [m.name for m, _t in T.pick_materials([], loaded)] == ["표본통계학 보충.pdf"])
+info = types.SimpleNamespace(flag_bits=0, filename="7주차교재.pdf".encode("cp949").decode("cp437"))
+check("옛 압축의 한글 이름을 풀어 읽음", T.zip_member_name(info) == "7주차교재.pdf",
+      T.zip_member_name(info))
+_pages, _labels, _o = T.material_pages(loaded[:2])
+check("자료가 여럿이면 쪽 이름에 자료 이름", _labels[0] == "7주차교재 1쪽" and _labels[-1] == "7실습지 1쪽",
+      str(_labels[:1] + _labels[-1:]))
 
 # 34) 차례 제목은 배너·절번호·잡음을 건너뛰고 쓸 만한 줄을 고른다
 _p1 = ["S A M P L E U N I V E R S I T Y", "담당교수ㅣ 가 상 인", "7주차 2교시", "표본통계학"]
@@ -418,7 +526,7 @@ with tempfile.TemporaryDirectory(prefix="mdcheck_", dir=T.tmp_root()) as td:
     check("의심 문단에 ⚠", "**[00:33:20]** ⚠ 이상한" in t)
     check("옮기지 못한 말소리 구간 표시", "**[00:40:00]** ⚠ *(여기서 12초 동안" in t)
     check("머리말에 경고 요약", "재생된 영상 1곳" in t and "흔들린 문단 1개" in t
-          and "빠졌던 말소리 1곳(20초)" in t and "옮기지 못한 구간 1곳" in t)
+          and "잘못 옮겨진 말소리 1곳(20초)" in t and "옮기지 못한 구간 1곳" in t)
 
     mark = T.read_marker(out)
     check("마커 왕복", mark and mark.get("pdf") == "재무관리 12주차.pdf"

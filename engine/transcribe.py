@@ -19,7 +19,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter, defaultdict
+import zipfile
+from collections import Counter, defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -63,7 +64,7 @@ MEDIA_EXTS = {".mp4", ".m4a", ".mp3", ".wav", ".mkv", ".mov", ".webm",
 
 # 엔진 로직 판(版). 문단화·OCR·출력 형식을 바꿀 때마다 올린다.
 # 이 값이 산출물 지문에 들어가므로, 올리면 기존 MD가 자동으로 다시 만들어진다.
-ENGINE_REV = 9
+ENGINE_REV = 12
 
 # 강의자료 PDF 연동 — 화면에서 읽은 글자는 "몇 쪽인가"를 알아내는 열쇠로만 쓰고,
 # 실을 내용은 PDF 원문을 그대로 가져온다. OCR 잡음이 사라지고 표·빈칸이 보존된다.
@@ -112,6 +113,8 @@ GAP_PAD_SEC = 0.3
 REPAIR_MAX = 30          # 파일당 다시 읽는 구간 수의 상한
 REPAIR_MIN_CPS = 3.0     # 초당 글자가 이보다 적으면 복구가 아니라 환각이다
 LOST_MIN_SEC = 8.0       # 복구하지 못한 빈틈이 이보다 길면 산출물에 알린다
+RELANG_MIN_PROB = 0.7    # ⚠ 구간을 다른 언어로 갈아끼우려면 그 언어라고 이만큼 확신해야 한다
+VIDEO_JOIN_SEC = 30      # 재생 영상 구간 사이의 틈이 이보다 짧으면 같은 영상으로 잇는다
 HALLUCINATIONS = ("시청해주셔서 감사합니다", "시청해 주셔서 감사합니다", "구독과 좋아요",
                   "thank you for watching", "thanks for watching", "subtitles by")
 
@@ -458,6 +461,66 @@ def repair_gaps(model, audio, segments, cfg, sr=16000):
     return added, fixed, lost
 
 
+def suspect_spans(segments, join=GAP_JOIN_SEC, min_len=GAP_MIN_SEC):
+    """⚠ 세그먼트가 이어진 구간들 (가까우면 합친다)."""
+    spans = []
+    for s in segments:
+        if not s[3]:
+            continue
+        if spans and s[0] - spans[-1][1] <= join:
+            spans[-1][1] = max(spans[-1][1], s[1])
+        else:
+            spans.append([s[0], s[1]])
+    return [(a, b) for a, b in spans if b - a >= min_len]
+
+
+def reread_suspects(model, audio, segments, main_lang, cfg, sr=16000):
+    """⚠ 구간을 언어를 새로 정해 다시 읽고, 다른 언어로 확신 있게 읽히면 갈아끼운다.
+
+    파일 언어로 고정해 읽으면 다른 언어로 말한 대목이 빠지기도 하지만(repair_gaps),
+    그 언어의 **그럴듯한 환각으로 채워지기도** 한다 — 실강의(영어 강의 속 한국어 뉴스
+    영상)에서 한국어 말소리 자리에 그럴듯한 영어 헛문장이 9분간
+    이어졌다. 빈틈이 없으니 복구 장치가 못 잡는다. ⚠ 는 붙어 있으므로 그 구간을 다시 읽는다.
+    같은 언어로 나오면 진짜 음질 문제이므로 그대로 둔다(⚠ 유지).
+
+    돌려주는 값은 (새 세그먼트 목록, 바꾼 구간 [(시작, 끝, 언어)]).
+    """
+    swapped = []
+    for a, b in suspect_spans(segments)[:REPAIR_MAX]:
+        status(f"  다른 언어로 말한 대목인지 다시 읽는 중... [{fmt_ts(a)}]")
+        lo = max(0.0, a - GAP_PAD_SEC)
+        clip = audio[int(lo * sr):int((b + GAP_PAD_SEC) * sr)]
+        try:
+            segs, info = model.transcribe(clip, beam_size=cfg["beam_size"], vad_filter=True,
+                                          vad_parameters=VAD_PARAMS, word_timestamps=True,
+                                          **QUALITY)
+            segs = list(segs)
+        except Exception:
+            continue
+        good = [s for s in segs if not is_suspect(s)]
+        if (info.language == main_lang or info.language_probability < RELANG_MIN_PROB
+                or not segs or len(good) < 0.7 * len(segs)):
+            continue
+        new = []
+        for s in good:
+            words = [w for w in segment_words(s, lo) if a - 1 <= (w[0] + w[1]) / 2 <= b + 1]
+            text = "".join(w[2] for w in words).strip()
+            if text and not any(h in text.lower().replace(" ", "")
+                                for h in (x.replace(" ", "") for x in HALLUCINATIONS)):
+                new.append((words[0][0], words[-1][1], text, False, words))
+        kept = [s for s in segments if not (a <= s[0] <= b and s[3])]
+        # 구간 안에 남은 확실한 세그먼트(교수의 짧은 말 등)와 겹치는 낱말은 버린다
+        inside = [(s[0], s[1]) for s in kept if a <= s[0] <= b]
+        new = [n for n in new if not any(x <= (n[0] + n[1]) / 2 <= y for x, y in inside)]
+        if not new:
+            continue
+        segments = kept + new
+        swapped.append((a, b, info.language))
+    status("")
+    sys.stdout.write("\r")
+    return sorted(segments, key=lambda s: s[0]), swapped
+
+
 def split_phrases(segments):
     """세그먼트를 낱말 시각으로 짧은 구절로 나눈다. (시작, 끝, 글, 의심) 목록.
 
@@ -687,30 +750,56 @@ def read_screen(ff, tess, src, t, crop, png, langs):
         png.unlink(missing_ok=True)
 
 
-def pick_crop(ff, tess, src: Path, duration: float, tmp: Path, langs, pool, live_time) -> str:
-    """화면 전체와 좌측 일부를 견줘 글자가 더 잘 읽히는 쪽을 고른다.
+def speaker_on_right(shares) -> bool:
+    """슬라이드 쪽이 멈춰 있는 동안 오른쪽이 움직이는가 — 화자가 오른쪽에 있다는 뜻이다.
 
-    화자 얼굴이 곁들여진 녹화 강의는 잘라내야 목차·제목까지 읽히고,
-    슬라이드만 꽉 찬 영상은 자르면 오른쪽 내용을 잃는다. 그래서 재보고 정한다.
-
-    줄 수만 세면 화자 쪽 무늬(배경 포스터·이름 자막·옷 무늬)가 읽다 만 글자로 잡혀
-    '전체 화면'이 이긴다(합성 강의 실측). 그래서 깨진 줄은 감점한다. 오른쪽이 한 번도
-    움직이지 않았으면 화자 창이 없는 것이니 재 볼 필요도 없다.
+    '오른쪽이 한 번이라도 움직였나'로 보면, 슬라이드가 화면 전체인 강의에서 전체 화면
+    영상이 재생될 때도 참이 되어 슬라이드를 잘라 읽었다(실강의: 모든 슬라이드의 오른쪽
+    3분의 1이 사라졌다). 전체 시간의 좌우 비율로 보면, 영상을 19분 튼 좌우 분할 강의에서
+    왼쪽도 많이 움직여 화자를 놓쳤다. 영상 재생 시간을 빼고 보면 뚜렷이 갈린다
+    (실측: 화자 있음 0.23·0.25, 없음 0.001). 판단할 만큼 멈춘 시간이 없으면 자르지 않는다.
+    shares 는 초마다 (화면 전체, 좌측 슬라이드 쪽) 움직인 칸의 비율이다.
     """
-    cols = int(live_time.shape[1] * SLIDE_CROP) if live_time is not None else 0
-    if not cols or live_time[:, cols:].mean() < 0.02:
-        return ""
-    crop = f"crop=iw*{SLIDE_CROP}:ih:0:0,"
+    gw = SCAN_W // LIVE_CELL
+    cut = int(gw * SLIDE_CROP)
+    calm = [((f * gw - l * cut) / (gw - cut), l) for f, l in shares[1:] if l < 0.05]
+    if len(calm) < 60:
+        return False
+    right = sum(r for r, _l in calm) / len(calm)
+    left = sum(l for _r, l in calm) / len(calm)
+    return right >= 0.03 and right >= 5 * left
 
-    def score(frac, c):
-        lines = read_screen(ff, tess, src, duration * frac, c,
-                            tmp / f"probe_{frac}_{bool(c)}.png", langs)
-        return sum(-0.5 if looks_garbled(ln) else 1 for ln in lines)
-    jobs = {pool.submit(score, frac, c): c for frac in (0.25, 0.5, 0.75) for c in ("", crop)}
+
+def pick_crop(ff, tess, src: Path, duration: float, tmp: Path, langs, pool) -> str:
+    """화자가 오른쪽에 있을 때, 좌측만 잘라 읽을지 정한다.
+
+    화자 창이 따로 있는 녹화 강의는 잘라내야 목차·제목까지 읽히고(전체를 읽으면 제목을
+    놓치고 화자 쪽 잡음이 줄 끝에 붙는다), 교수가 슬라이드 위에 겹쳐 선 강의는 자르면
+    오른쪽 글자를 잃는다. 그래서 **오른쪽 띠만 따로 읽어** 확신 있게 읽힌 글자가 슬라이드
+    쪽의 25% 이상이면 슬라이드가 오른쪽까지 이어진 것으로 보고 자르지 않는다.
+
+    전체와 잘라 읽기를 통째로 견주면 안 된다 — 줄 수는 잘린 줄도 한 줄로 세고, 글자 수는
+    화자 쪽 잡음이 붙어 늘고, 깨짐 판정은 글머리표(`=`)·URL 이 든 멀쩡한 줄까지 깎았다(실측).
+    """
+    crop = f"crop=iw*{SLIDE_CROP}:ih:0:0,"
+    strip = f"crop=iw*{1 - SLIDE_CROP:.2f}:ih:iw*{SLIDE_CROP}:0,"
+
+    def sure_chars(frac, region):
+        png = tmp / f"probe_{frac}_{len(region)}.png"
+        try:
+            if not grab_frame(ff, src, duration * frac, f"{region}scale=iw*2:ih*2", png):
+                return 0
+            return max(sum(len(ln[1]) for ln in ocr_lines(tess, png, lg) if ln[2] >= 80)
+                       for lg in langs)
+        except subprocess.TimeoutExpired:
+            return 0
+        finally:
+            png.unlink(missing_ok=True)
+    jobs = {pool.submit(sure_chars, frac, r): r for frac in (0.25, 0.5, 0.75) for r in (crop, strip)}
     total = Counter()
     for fut in as_completed(jobs):
         total[jobs[fut]] += fut.result()
-    return crop if total[crop] > total[""] else ""
+    return "" if total[strip] >= 0.25 * max(total[crop], 1) else crop
 
 
 def select_frames(frames):
@@ -719,21 +808,26 @@ def select_frames(frames):
     직전 초가 아니라 **마지막으로 고른 화면**과 견준다 — 조금씩 늘어나는 판서·항목도
     쌓이면 잡힌다. 계속 움직이는 칸(화자 창, 화면 속 동영상, 커서)은 스스로 알아내
     비교에서 뺀다. 그래서 30초 안전 샘플이 필요 없다.
-    돌려주는 값은 (고른 초 목록, 칸마다 움직이던 시간의 비율,
+
+    화면 전체 기준과 좌측 슬라이드 영역 기준을 **한 번의 디코딩으로 함께** 고른다.
+    화자는 가끔씩만 움직여 '계속 움직이는 칸'으로 걸러지지 않는다 — 실강의 44분에서
+    고른 화면 322장 중 170장이 화자 쪽 변화였다. 잘라 읽기로 정해지면 좌측 기준을 쓴다.
+    돌려주는 값은 (전체 기준 고른 초, 좌측 기준 고른 초, 칸마다 움직이던 시간의 비율,
     초마다 움직이던 비율 [(화면 전체, 좌측 슬라이드 쪽)]).
     """
     import numpy as np
-    picks, last, last_n, prev, ema, settle_at = [], None, None, None, None, None
-    live_sum, shares = None, []
+    chains, prev, ema, live_sum, shares = None, None, None, None, []
     for n, f in frames:
         f = f.astype(np.int16)
         h, w = f.shape
         gh, gw = h // LIVE_CELL, w // LIVE_CELL
+        cut = int(gw * SLIDE_CROP)
         if prev is None:
             ema, live_sum = np.zeros((gh, gw)), np.zeros((gh, gw))
-            picks.append(n)
+            # 영역마다 [고른 초, 마지막으로 고른 화면, 그 초, 재확인할 초]
+            chains = {k: [[n], f, n, None] for k in ("full", "left")}
             shares.append((0.0, 0.0))
-            last, last_n, prev = f, n, f
+            prev = f
             continue
         moving = (np.abs(f - prev) > PIX_DELTA)[:gh * LIVE_CELL, :gw * LIVE_CELL]
         moving = moving.reshape(gh, LIVE_CELL, gw, LIVE_CELL).mean(axis=(1, 3)) > 0.02
@@ -743,26 +837,32 @@ def select_frames(frames):
         live_sum += live
         # 자막 판정용은 지수평균이 아니라 지금 이 순간의 움직임이다 — 지수평균은 영상이
         # 끝난 뒤에도 10초 넘게 남아 바로 다음 슬라이드까지 영상으로 묶었다
-        shares.append((float(moving.mean()), float(moving[:, :int(gw * SLIDE_CROP)].mean())))
-        still = np.repeat(np.repeat(~live, LIVE_CELL, 0), LIVE_CELL, 1)
-        diff = np.abs(f - last)[:gh * LIVE_CELL, :gw * LIVE_CELL]
-        ratio = (diff[still] > PIX_DELTA).mean() if still.any() else 0.0
-        gap = n - last_n
-        pick = False
-        if ratio > CHANGE_RATIO and gap >= MIN_GAP_SEC:
-            pick, settle_at = True, n + SETTLE_SEC
-        elif settle_at is not None and n >= settle_at:
-            settle_at = None
-            pick = bool(still.any()) and diff[still].mean() > 0.3   # 흐릿했던 것이 선명해졌다
-        elif live.mean() > VIDEO_LIVE and gap >= VIDEO_GAP_SEC:
-            pick = True
-        if pick:
-            picks.append(n)
-            last, last_n = f, n
+        shares.append((float(moving.mean()), float(moving[:, :cut].mean())))
+        for key, chain in chains.items():
+            picks, last, last_n, settle_at = chain
+            region = ~live if key == "full" else ~live & (np.arange(gw) < cut)
+            still = np.repeat(np.repeat(region, LIVE_CELL, 0), LIVE_CELL, 1)
+            diff = np.abs(f - last)[:gh * LIVE_CELL, :gw * LIVE_CELL]
+            ratio = (diff[still] > PIX_DELTA).mean() if still.any() else 0.0
+            area = live if key == "full" else live[:, :cut]
+            gap = n - last_n
+            pick = False
+            if ratio > CHANGE_RATIO and gap >= MIN_GAP_SEC:
+                pick, settle_at = True, n + SETTLE_SEC
+            elif settle_at is not None and n >= settle_at:
+                settle_at = None
+                pick = bool(still.any()) and diff[still].mean() > 0.3   # 흐릿했던 것이 선명해졌다
+            elif area.mean() > VIDEO_LIVE and gap >= VIDEO_GAP_SEC:
+                pick = True
+            if pick:
+                picks.append(n)
+                last, last_n = f, n
+            chain[1:] = [last, last_n, settle_at]
         prev = f
-    live_time = live_sum / max(len(shares) - 1, 1) if live_sum is not None else None
-    return picks, live_time, shares
-
+    if chains is None:
+        return [], [], None, shares
+    live_time = live_sum / max(len(shares) - 1, 1)
+    return chains["full"][0], chains["left"][0], live_time, shares
 
 def live_share(shares, n: int, crop: str, ahead: int = 4) -> float:
     """n초 화면이 떠 있는 동안(직후 몇 초) 화면(잘라 읽으면 슬라이드 쪽)이 움직인 비율.
@@ -803,7 +903,7 @@ def scan_screen_changes(ff, src: Path, tmp: Path):
                 yield n, np.frombuffer(b, np.uint8).reshape(SCAN_H, SCAN_W)
                 n += 1
         try:
-            picks, live_time, shares = select_frames(frames())
+            picks, picks_left, live_time, shares = select_frames(frames())
         finally:
             p.stdout.close()
             p.wait()
@@ -811,7 +911,7 @@ def scan_screen_changes(ff, src: Path, tmp: Path):
         detail = err.read_text(encoding="utf-8", errors="replace").strip().splitlines()
         raise RuntimeError("화면을 뽑아내지 못했습니다"
                            + (f" — {detail[-1][:160]}" if detail else ""))
-    return picks, live_time, shares
+    return picks, picks_left, live_time, shares
 
 
 def slide_key(lines):
@@ -864,9 +964,13 @@ def extract_slides(src: Path, tmp: Path, tess: str, duration: float, langs):
     pool = ThreadPoolExecutor(OCR_WORKERS)
     try:
         status("  화면이 바뀌는 지점을 찾는 중...")
-        picks, live_time, shares = scan_screen_changes(ff, src, shots)
-        status("  화면 영역을 정하는 중...")
-        crop = pick_crop(ff, tess, src, duration or 600, shots, langs, pool, live_time)
+        picks, picks_left, live_time, shares = scan_screen_changes(ff, src, shots)
+        # 화자가 오른쪽에 있으면 화자 쪽 변화로 고른 화면은 필요 없다 — 전체를 읽더라도
+        side = speaker_on_right(shares)
+        if side:
+            picks = picks_left
+            status("  화면 영역을 정하는 중...")
+        crop = pick_crop(ff, tess, src, duration or 600, shots, langs, pool) if side else ""
         jobs = {pool.submit(read_screen, ff, tess, src, n, crop,
                             shots / f"f_{n:06d}.png", langs): n for n in picks}
         found = []
@@ -879,8 +983,9 @@ def extract_slides(src: Path, tmp: Path, tess: str, duration: float, langs):
         status("")
         sys.stdout.write("\r")
     found.sort(key=lambda x: x[0])
-    live = {max(0.0, n - 0.5): live_share(shares, n, crop) for n in picks}
-    motion = [s[1 if crop else 0] for s in shares]
+    # 움직임은 화자 쪽을 뺀 슬라이드 쪽으로 잰다 (화자가 오른쪽에 있을 때)
+    live = {max(0.0, n - 0.5): live_share(shares, n, side) for n in picks}
+    motion = [s[1 if side else 0] for s in shares]
     return merge_slides(found), live, motion
 
 
@@ -899,32 +1004,73 @@ def stem_week(stem: str):
     return int(m.group()) if m else None
 
 
+# 강의자료 한 건. name 은 표시·지문용("묶음.zip/교재.pdf"), stem 은 쪽 이름용,
+# named 는 파일 이름에 이 강의가 적혀 있는지(아니면 주차만 같은 후보),
+# container 는 같은 묶음(zip·폴더)끼리 알아보는 열쇠, load 는 PDF 바이트를 돌려준다.
+Material = namedtuple("Material", "name stem week named container load")
+
+
+def zip_member_name(info) -> str:
+    """zip 안 이름. UTF-8 표시가 없는 옛 압축은 한국어 Windows 기준(cp949)으로 풀어 본다."""
+    if info.flag_bits & 0x800:
+        return info.filename
+    try:
+        return info.filename.encode("cp437").decode("cp949")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return info.filename
+
+
+def iter_materials():
+    """강의자료 폴더의 PDF — LMS 에서 받은 zip 묶음 안의 PDF 도 포함한다."""
+    if not PDF_DIR.is_dir():
+        return
+    for p in sorted(PDF_DIR.rglob("*")):
+        suffix = p.suffix.lower()
+        if suffix == ".pdf":
+            yield p.name, p.stem, p.stem, str(p.parent), (lambda p=p: p.read_bytes())
+        elif suffix == ".zip":
+            try:
+                with zipfile.ZipFile(p) as z:
+                    members = [i for i in z.infolist()
+                               if not i.is_dir() and i.filename.lower().endswith(".pdf")]
+            except (zipfile.BadZipFile, OSError):
+                log(f"  ⚠ 강의자료 {p.name}을(를) 열 수 없습니다 (손상된 압축 파일).")
+                continue
+            for i in members:
+                inner = Path(zip_member_name(i))
+                yield (f"{p.name}/{inner.name}", inner.stem, f"{p.stem} {inner.stem}", str(p),
+                       lambda p=p, n=i.filename: zipfile.ZipFile(p).read(n))
+
+
 def find_slide_pdfs(src: Path):
-    """이 강의에 해당하는 강의자료 PDF를 **모두** 찾는다.
+    """이 강의에 해당할 수 있는 강의자료를 **모두** 찾는다.
 
     한 주차에 슬라이드 교재와 실습지가 따로 있는 것이 보통이므로 하나만 고르지
     않는다. 주차 번호를 읽을 수 있으면 서로 다를 때 걸러낸다 — 과목 이름만 겹치면
     7주차 자료가 6주차 강의에 붙는 사고가 난다.
+
+    LMS 에서 받은 그대로의 이름('6주차교재.pdf')에는 과목명이 없다. 그래서 주차만
+    같은 자료도 **후보**(named=False)로 넣고, 화면과 실제로 맞춰 본 뒤 채택한다
+    (pick_materials).
     """
-    if not PDF_DIR.is_dir():
-        return []
     course, week, _period = parse_course(src.stem)
     course_key = re.sub(r"[^0-9a-z가-힣]+", "", course.lower())
     want = name_tokens(src.stem)
     hits = []
-    for p in sorted(PDF_DIR.rglob("*.pdf")):
-        have = name_tokens(p.stem)
+    for name, stem, match_text, container, load in iter_materials():
+        have = name_tokens(match_text)
         if not have:
             continue
-        flat = re.sub(r"[^0-9a-z가-힣]+", "", p.stem.lower())
-        ok = (course_key and course_key in flat) or (
+        flat = re.sub(r"[^0-9a-z가-힣]+", "", match_text.lower())
+        named = bool(course_key and course_key in flat) or (
             len(want & have) / min(len(want), len(have)) >= PDF_NAME_RATIO)
-        if not ok:
-            continue
-        pw = stem_week(p.stem)
+        pw = stem_week(stem)
+        if pw is None:
+            pw = stem_week(match_text)
         if week is not None and pw is not None and pw != week:
             continue
-        hits.append(p)
+        if named or (week is not None and pw == week):
+            hits.append(Material(name, stem, pw, named, container, load))
     return hits
 
 
@@ -945,41 +1091,69 @@ def drop_boilerplate(pages):
 
 
 def load_slide_materials(src: Path):
-    """짝이 맞는 PDF들의 쪽 글자와 쪽 이름을 한 줄로 이어 붙인다.
+    """후보 자료들을 읽어 (자료, 쪽 글자 목록) 목록과 지문용 이름 목록을 돌려준다.
 
-    돌려주는 값은 (쪽 글자 목록, 쪽 이름 목록, 실제로 쓴 파일 이름, 짝이 맞은 파일 이름).
-    마지막 값은 산출물 지문용이다 — 글자를 못 읽은 PDF도 "짝은 맞았다"로 기록해야
+    지문용 이름에는 글자를 못 읽은 자료도 넣는다 — "짝은 맞았다"로 기록해야
     같은 자료로 매번 다시 변환하는 일이 생기지 않는다.
     """
     found = find_slide_pdfs(src)
-    if not found:
-        return [], [], [], []
-    pages, labels, used = [], [], []
-    texts = {p: read_pdf_pages(p) for p in found}
-    many = sum(1 for p in found if texts[p]) > 1
-    for p in found:
-        got = texts[p]
-        if not got:
-            log(f"  ⚠ 강의자료 {p.name}에서 글자를 읽지 못했습니다"
+    loaded = []
+    for m in found:
+        try:
+            pages = read_pdf_pages(m.load())
+        except (OSError, zipfile.BadZipFile, KeyError):
+            pages = []
+        if pages and any(t.strip() for t in pages):
+            loaded.append((m, pages))
+        else:
+            log(f"  ⚠ 강의자료 {m.name}에서 글자를 읽지 못했습니다"
                 f" (그림으로 스캔된 PDF일 수 있습니다).")
-            continue
-        used.append(p.name)
-        for i, text in enumerate(got, 1):
+    return loaded, [m.name for m in found]
+
+
+def material_pages(chosen):
+    """고른 자료들의 쪽 글자와 쪽 이름을 한 줄로 이어 붙인다. 되풀이되는 배너는 뺀다."""
+    pages, labels, owner = [], [], []
+    many = len(chosen) > 1
+    stems = Counter(m.stem for m, _t in chosen)
+    for k, (m, texts) in enumerate(chosen):
+        tag = m.stem if stems[m.stem] == 1 else m.name     # 이름이 같은 자료끼리는 묶음까지 적는다
+        for i, text in enumerate(texts, 1):
             pages.append(text)
-            labels.append(f"{p.stem} {i}쪽" if many else f"{i}쪽")
+            labels.append(f"{tag} {i}쪽" if many else f"{i}쪽")
+            owner.append(k)
     lines = drop_boilerplate([[ln.rstrip() for ln in t.splitlines() if ln.strip()] for t in pages])
-    return ["\n".join(x) for x in lines], labels, used, [p.name for p in found]
+    return ["\n".join(x) for x in lines], labels, owner
 
 
-def read_pdf_pages(path: Path):
-    """PDF의 쪽별 글자. 읽지 못하면 빈 목록(부르는 쪽에서 알린다)."""
+def pick_materials(slides, loaded):
+    """후보 자료 가운데 이 강의 화면과 **실제로 맞는** 것만 남긴다.
+
+    이름에 강의가 적힌 자료는 그대로 쓴다. 주차만 같은 후보는 화면 2장 이상이 그
+    자료의 쪽과 맞아야 채택한다 — 다른 과목의 같은 주차 자료가 섞여 있어도 걸러진다.
+    쪽이 3쪽 이하인 작은 자료(실습지)는, 같은 묶음의 다른 자료가 채택됐으면 1장으로 족하다.
+    """
+    if not loaded or not slides:
+        return [x for x in loaded if x[0].named]
+    pages, labels, owner = material_pages(loaded)
+    who = dict(zip(labels, owner))
+    hits = Counter(who[a[2]] for a in align_slides_to_pdf(slides, pages, labels) if a[2])
+    keep = {k for k, (m, _t) in enumerate(loaded) if m.named or hits[k] >= 2}
+    kept_boxes = {loaded[k][0].container for k in keep}
+    keep |= {k for k, (m, t) in enumerate(loaded)
+             if hits[k] >= 1 and len(t) <= 3 and m.container in kept_boxes}
+    return [x for k, x in enumerate(loaded) if k in keep]
+
+
+def read_pdf_pages(data):
+    """PDF(경로 또는 바이트)의 쪽별 글자. 읽지 못하면 빈 목록(부르는 쪽에서 알린다)."""
     try:
         from pypdf import PdfReader
     except ImportError:
         return []
     try:
         pages = []
-        for page in PdfReader(str(path)).pages:
+        for page in PdfReader(io.BytesIO(data) if isinstance(data, bytes) else str(data)).pages:
             try:
                 pages.append(page.extract_text() or "")
             except Exception:
@@ -1410,6 +1584,129 @@ def screen_ends(screens, duration):
     return order, ends
 
 
+VIDEO_URL = re.compile(r"youtu|watch\?v=|vimeo|tv\.naver|naver\.me|tvcast|dailymotion", re.I)
+
+
+def motion_video_spans(motion, screens, win=20):
+    """슬라이드 쪽이 오래·크게 움직이고, 그 무렵 화면에 영상 출처 주소가 있으면 재생 영상이다.
+
+    자막 글자도 없고 교수와 같은 언어인 영상(인터뷰 등)은 앞의 두 근거로는 못 찾는다
+    (실강의: 94초 중 73초가 움직인 인터뷰가 교수의 말로 실렸다 — 보통 슬라이드는 70초 중 1초).
+    움직임만 믿으면 판서·반복 애니메이션까지 영상이 되어 교수의 말이 📺 가 되므로 셋을 함께 본다:
+      · 20초 동안 60% 넘는 초가 움직이고 평균 움직임이 0.08 이상(판서는 가는 선이라 훨씬 작다)
+      · 그 구간이나 직전 15초에 뜬 화면에 영상 출처 주소(youtube 등)가 적혀 있다
+      · 강의의 40% 이상이 정지 슬라이드다 — 카메라만 비추는 강의는 움직임으로 가를 수 없다
+    """
+    if not motion or sum(1 for m in motion if m < 0.05) < 0.4 * len(motion):
+        return []
+    hot = [False] * len(motion)
+    for s in range(len(motion) - win + 1):
+        w = motion[s:s + win]
+        if sum(1 for m in w if m > 0.02) >= 0.6 * win and sum(w) / win >= 0.08:
+            hot[s:s + win] = [True] * win
+    spans, start = [], None
+    for n, h in enumerate(hot + [False]):
+        if h and start is None:
+            start = n
+        elif not h and start is not None:
+            # 20초 창은 실제 움직임보다 앞뒤로 넓다 — 실제로 움직인 첫 초와 마지막 초로 다듬는다
+            moved = [k for k in range(start, n) if motion[k] > 0.02]
+            spans.append((max(0.0, moved[0] - 0.5), moved[-1] + 0.5))
+            start = None
+    return [(a, b) for a, b in spans
+            if any(VIDEO_URL.search(" ".join(sc[1])) for sc in screens if a - 15 <= sc[0] < b)]
+
+
+def mark_video(spans, screens, extra):
+    """재생 영상 구간을 보태고, 그 안의 (강의자료 쪽이 아닌) 화면을 영상 화면으로 바꾼다."""
+    if not extra:
+        return list(spans), screens
+    merged = []
+    for a, b in sorted(list(spans) + list(extra)):
+        if merged and a <= merged[-1][1] + 2:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    screens = [(t, lines, page, "자막" if page is None and any(x - 0.5 <= t < y for x, y in extra)
+                else kind) for t, lines, page, kind in screens]
+    return merged, screens
+
+
+def add_language_spans(spans, screens, swapped, motion):
+    """다른 언어로 다시 읽힌 구간에서 슬라이드 쪽이 움직이고 있었으면 재생 영상이다.
+
+    교수의 말과 언어가 다르고 화면이 움직인다 — 자막 글자가 없어도(뉴스 화면 등)
+    재생된 영상이라고 볼 근거가 충분하다. 그 사이의 화면은 영상 화면으로 묶는다.
+    """
+    moving = lambda a, b: (lambda s: bool(s) and sum(s) / len(s) >= SUBTITLE_LIVE)(
+        motion[int(a):int(b) + 1])
+    extra = []
+    for a, b, _lang in sorted(swapped):
+        if not moving(a, b):
+            continue
+        # 사이가 1분 이내이고 그동안에도 화면이 움직였으면 같은 영상이다 — 그 사이에는 영상 속
+        # 노래나, 교수 언어로 '번역'되어 ⚠ 없이 남은 말이 있다(실강의). 교수의 말로 읽히면 안 된다.
+        if extra and a - extra[-1][1] <= 60 and moving(extra[-1][1], a):
+            extra[-1] = (extra[-1][0], b)
+        else:
+            extra.append((a, b))
+    return mark_video(spans, screens, extra)
+
+
+def foreign_spans(segments, main_lang):
+    """교수의 언어와 다른 문자로 옮겨진 구간 — 영어 강의 속 한글 문장, 한국어 강의 속 영어 대목.
+
+    재독으로 바뀐 구간만 보면, 처음부터 그 언어로 옮겨진 첫 문장(뉴스 앵커의 첫마디)이
+    빠져 영상 구간이 2초 늦게 시작됐다(실강의). 한국어 강의의 영어는 용어가 흔하므로
+    영어가 압도적인 긴 문장만 센다.
+    """
+    out = []
+    for s in segments:
+        han = sum("가" <= c <= "힣" for c in s[2])
+        lat = sum(c.isascii() and c.isalpha() for c in s[2])
+        if not ((main_lang == "en" and han >= 6 and han > lat)
+                or (main_lang == "ko" and lat >= 20 and lat > 3 * han)):
+            continue
+        if out and s[0] - out[-1][1] <= GAP_JOIN_SEC:
+            out[-1] = (out[-1][0], max(out[-1][1], s[1]), out[-1][2])
+        else:
+            out.append((s[0], s[1], "ko" if main_lang == "en" else "en"))
+    return out
+
+
+def join_video_spans(spans, screens, foreign=(), phrases=(), max_gap=VIDEO_JOIN_SEC):
+    """짧은 틈으로 끊긴 재생 영상 구간을 잇는다.
+
+    설명 영상은 움직이는 장면과 정지된 글자 카드가 번갈아 나온다 — 정지 카드에서 구간이
+    끊기면 그동안의 영상 내레이션이 교수의 말로 읽혔다(실강의). 틈이 max_gap 이내면 잇고,
+    90초 이내라도 그 사이 화면이 2장 이상 빠르게(평균 20초 미만) 바뀌었으면 글자 카드로 보고
+    잇는다(실강의: 32초 동안 카드 4장). 교수의 슬라이드는 한 장이 오래 떠 있다. 잇지 않는 경우:
+      · 틈에 강의자료 쪽이 떴다 — 교수가 슬라이드로 돌아온 것이다
+      · 양쪽이 교수와 다른 언어의 영상인데 틈에 교수 언어의 말이 있다 — 두 클립 사이에
+        교수가 논평한 것이다(실강의: 한국어 뉴스 두 클립 사이의 영어 논평 18초)
+    """
+    def is_foreign(a, b):
+        return any(x < b and a < y for x, y, _l in foreign)
+
+    joined = []
+    for a, b in sorted(spans):
+        cards = [s for s in screens if joined and joined[-1][1] <= s[0] < a]
+        near = joined and (a - joined[-1][1] <= max_gap or (
+            a - joined[-1][1] <= 90 and len(cards) >= 2 and (a - joined[-1][1]) / len(cards) < 20))
+        if near:
+            pa, pb = joined[-1]
+            gap_pdf = any(s[2] for s in screens if pb <= s[0] < a)
+            gap_talk = (is_foreign(pa, pb) or is_foreign(a, b)) and any(
+                pb <= p[0] < a and not is_foreign(p[0], p[1]) for p in phrases)
+            if not gap_pdf and not gap_talk:
+                joined[-1] = (pa, max(pb, b))
+                continue
+        joined.append((a, b))
+    screens = [(t, lines, page, "자막" if page is None and any(x - 0.5 <= t < y for x, y in joined)
+                else kind) for t, lines, page, kind in screens]
+    return joined, screens
+
+
 def write_markdown(out_path: Path, src: Path, info, paragraphs, cfg, screens=(),
                    pdf_name=None, pdf_tag=None, vad_lost=0.0, repaired=(), lost=(), spans=None):
     """screens 는 label_slides 가 돌려준 (시각, 줄, 쪽, 종류) 목록이다.
@@ -1453,9 +1750,8 @@ def write_markdown(out_path: Path, src: Path, info, paragraphs, cfg, screens=(),
         lines.append(f"- ⚠ **인식이 흔들린 문단 {len(suspect)}개**(`⚠` 표시): "
                      f"원문과 다를 수 있습니다. 이 문단만으로 사실을 단정하지 마세요.")
     if repaired:
-        lines.append(f"- 🔁 처음 인식에서 빠졌던 말소리 {len(repaired)}곳"
-                     f"({sum(b - a for a, b in repaired):.0f}초)을 다시 읽어 채웠습니다 "
-                     f"(다른 언어로 말한 대목 등).")
+        lines.append(f"- 🔁 처음 인식에서 빠졌거나 다른 언어로 잘못 옮겨진 말소리 {len(repaired)}곳"
+                     f"({sum(b - a for a, b in repaired):.0f}초)을 다시 읽어 채웠습니다.")
     if lost:
         lines.append(f"- ⚠ **말소리가 있었지만 옮기지 못한 구간 {len(lost)}곳**이 본문에 "
                      f"표시되어 있습니다(음악·잡음이거나 알아들을 수 없는 발화).")
@@ -1556,12 +1852,6 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
     if media["duration"] and media["duration"] > 4 * 3600:
         print(f"  ⚠ {fmt_ts(media['duration'])}짜리 긴 파일입니다. 메모리를 많이 사용합니다.")
 
-    # 강의자료 PDF가 있으면 그 원문을 싣고, 전문용어는 전사 힌트로도 쓴다
-    pdf_pages, pdf_labels, pdf_used, pdf_all = load_slide_materials(src)
-    hot = pdf_hotwords(pdf_pages) if pdf_pages else ""
-    if pdf_pages:
-        print(f"  강의자료 {', '.join(pdf_used)} (총 {len(pdf_pages)}쪽)을 함께 씁니다.")
-
     wav = tmp_dir / (safe_stem(out_path.stem, 60) + ".wav")
     try:
         status("  오디오 추출 중...")
@@ -1574,6 +1864,38 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
         audio = decode_audio(str(wav if used_ffmpeg else src), sampling_rate=16000)
     finally:
         wav.unlink(missing_ok=True)
+
+    # 화면을 먼저 읽는다 — 강의자료 후보를 화면과 맞춰 본 뒤, 실제로 맞는 자료의
+    # 전문용어만 음성 인식 힌트로 넘기기 위해서다(다른 과목 자료의 용어가 섞이면 안 된다).
+    loaded, pdf_all = load_slide_materials(src)
+    slides, live, motion = [], {}, []
+    if cfg["슬라이드_읽기"] and tess and media["video"]:
+        try:
+            # 발화 언어는 아직 모르지만, 순서는 두 판본의 점수가 똑같을 때만 영향을 준다
+            langs = ocr_lang_options(cfg, cfg["language"] if cfg["language"] != "auto" else "ko")
+            slides, live, motion = extract_slides(src, tmp_dir, tess,
+                                                  media["duration"] or len(audio) / 16000, langs)
+            print(f"  슬라이드 {len(slides)}장을 읽었습니다." if slides
+                  else "  (화면에서 읽을 만한 글자를 찾지 못했습니다)")
+        except Exception as e:
+            # print만 하면 창을 닫은 뒤 흔적이 없다. 기록에 남겨 사후 진단이 되게 한다.
+            log(f"  ⚠ 슬라이드를 읽지 못했습니다: {out_path.name} — {e}"
+                f" (음성 전사는 정상 저장)")
+
+    chosen = pick_materials(slides, loaded)
+    pdf_used = [m.name for m, _t in chosen]
+    pdf_pages, pdf_labels, _owner = material_pages(chosen)
+    for m, _t in loaded:
+        if m.name not in pdf_used:
+            print(f"  (강의자료 {m.name}은(는) 이 강의 화면과 맞지 않아 쓰지 않습니다)")
+    if pdf_pages:
+        print(f"  강의자료 {', '.join(pdf_used)} (총 {len(pdf_pages)}쪽)을 함께 씁니다.")
+        if slides:
+            slides = align_slides_to_pdf(slides, pdf_pages, pdf_labels)
+            matched = sum(1 for s in slides if s[2])
+            print(f"  그중 {matched}장을 강의자료 원문으로 바꿨습니다 "
+                  f"(잡음 없이 표·빈칸까지 그대로).")
+    hot = pdf_hotwords(pdf_pages) if pdf_pages else ""
 
     t0 = time.monotonic()
     # 순차 경로: 온도 폴백 + 반복/저신뢰 감지가 살아 있고 타임스탬프가 정밀하다.
@@ -1594,10 +1916,15 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
     status("")
     sys.stdout.write("\r")
 
+    collected, swapped = reread_suspects(model, audio, collected, info.language, cfg)
+    if swapped:
+        print(f"  다른 언어로 말한 대목 {len(swapped)}곳을 그 언어로 다시 읽었습니다 "
+              f"({', '.join(sorted({l for *_s, l in swapped}))}).")
     added, repaired, lost = repair_gaps(model, audio, collected, cfg)
     if repaired:
         print(f"  처음 인식에서 빠진 말소리 {len(repaired)}곳을 다시 읽어 채웠습니다.")
     collected = sorted(collected + added, key=lambda s: s[0])
+    repaired = sorted(repaired + [(a, b) for a, b, _l in swapped])
     del audio
     elapsed = time.monotonic() - t0
 
@@ -1605,27 +1932,13 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
     if not phrases:
         raise RuntimeError("음성이 감지되지 않았습니다 (오디오 트랙이 없거나 무음일 수 있습니다)")
 
-    slides, live, motion = [], {}, []
-    if cfg["슬라이드_읽기"] and tess and media["video"]:
-        try:
-            langs = ocr_lang_options(cfg, info.language)
-            slides, live, motion = extract_slides(src, tmp_dir, tess,
-                                                  media["duration"] or info.duration, langs)
-            print(f"  슬라이드 {len(slides)}장을 읽었습니다." if slides
-                  else "  (화면에서 읽을 만한 글자를 찾지 못했습니다)")
-            if slides and pdf_pages:
-                slides = align_slides_to_pdf(slides, pdf_pages, pdf_labels)
-                matched = sum(1 for s in slides if s[2])
-                print(f"  그중 {matched}장을 강의자료 원문으로 바꿨습니다 "
-                      f"(잡음 없이 표·빈칸까지 그대로).")
-        except Exception as e:
-            # print만 하면 창을 닫은 뒤 흔적이 없다. 기록에 남겨 사후 진단이 되게 한다.
-            log(f"  ⚠ 슬라이드를 읽지 못했습니다: {out_path.name} — {e}"
-                f" (음성 전사는 정상 저장)")
-
-    # 화면에서 읽은 글자에도 되풀이되는 배너가 있으면 뺀다 (PDF 쪽은 이미 뺐다)
+    # 화면에서 읽은 글자에도 되풀이되는 배너가 있으면 뺀다 (PDF 쪽은 이미 뺐다).
+    # 그림 화면에서 나온 잡음 줄('NW', '| Sy \')도 뺀다 — 글자 3자 미만에 숫자도 없는 줄.
+    # 숫자만 있는 줄은 표 내용일 수 있어 남긴다.
     ocr_only = [i for i, s in enumerate(slides) if len(s) < 3 or not s[2]]
-    cleaned = drop_boilerplate([slides[i][1] for i in ocr_only])
+    cleaned = drop_boilerplate([[ln for ln in slides[i][1]
+                                 if sum(ch.isalpha() for ch in ln) >= 3 or any(ch.isdigit() for ch in ln)]
+                                for i in ocr_only])
     for i, body in zip(ocr_only, cleaned):
         slides[i] = (slides[i][0], body) + tuple(slides[i][2:])
     slides = [s for s in slides if s[1]]
@@ -1633,6 +1946,10 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
     screens = label_slides(slides, [(p[0], p[2]) for p in phrases], live)
     order, ends = screen_ends(screens, info.duration)
     spans = video_spans([screens[i] for i in order], [ends[i] for i in order], motion)
+    foreign = sorted(set(swapped) | set(foreign_spans(collected, info.language)))
+    spans, screens = add_language_spans(spans, screens, foreign, motion)
+    spans, screens = mark_video(spans, screens, motion_video_spans(motion, screens))
+    spans, screens = join_video_spans(spans, screens, foreign, phrases)
     # 슬라이드가 바뀐 때와 영상이 시작된 때 문단을 끊는다
     paragraphs = group_paragraphs(phrases, [s[0] for s in screens if s[3] == "슬라이드"]
                                   + [a for a, _b in spans])

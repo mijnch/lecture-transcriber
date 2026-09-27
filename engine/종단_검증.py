@@ -227,6 +227,7 @@ def transcribe(work, mp4, pdf):
     shutil.copy2(pdf, work / "pdf" / pdf.name)
     T.IN_DIR, T.OUT_DIR, T.PDF_DIR = work / "in", work / "out", work / "pdf"
     T.LOG_FILE, T.CONFIG_FILE = work / "log.txt", work / "설정.ini"
+    T.ENGINE_DIR = work        # 중복 실행 잠금도 따로 — 실제 전사가 돌고 있어도 검증은 돈다
     sys.argv = sys.argv[:1]
     os.startfile = lambda *a, **k: None               # 결과 폴더를 열지 않는다
     sys.modules["winsound"] = types.SimpleNamespace(MessageBeep=lambda *a: None,
