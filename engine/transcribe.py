@@ -45,6 +45,13 @@ LOG_FILE = BASE / "실행기록.txt"
 # 여기 두면 흔적이 도구 폴더 안에서만 생기고 cleanup_stale_temp() 가 회수한다.
 TMP_ROOT = BASE / ".tmp"
 
+# 모델 내려받기(huggingface_hub·hf_xet)는 모델 파일 말고도 청크 캐시·로그를 둘 곳을
+# HF_HOME(기본값은 사용자 홈의 .cache/huggingface)에서 정한다. 모델 자체는 download_root
+# 로 engine/models 에 받지만 이 부가 캐시는 그 인자를 따르지 않는다. 실제로 무엇을
+# 쓰는지는 확인하지 못했다(점검 환경에서 HuggingFace 에 닿을 수 없었다) — 그래서
+# 예방으로 도구 폴더 안을 가리킨다. huggingface_hub 이 import 되기 전이어야 한다.
+os.environ["HF_HOME"] = str(TMP_ROOT / "huggingface")
+
 
 def tmp_root():
     """임시 폴더의 부모를 돌려준다(없으면 만든다).
