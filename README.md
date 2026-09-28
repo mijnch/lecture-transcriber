@@ -2,6 +2,7 @@
 
 [![tests](https://github.com/mijnch/lecture-transcriber/actions/workflows/tests.yml/badge.svg)](https://github.com/mijnch/lecture-transcriber/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![python](https://img.shields.io/badge/python-3.14-blue.svg)
 
 > 녹화 강의(MP4)를 **LLM이 원본 그대로 이해할 수 있는 Markdown**으로 바꾸는 로컬 도구.
 > 말소리뿐 아니라 화면의 슬라이드까지 읽어 시간순으로 엮고, **믿을 수 없는 대목에는 표식을 붙인다.**
@@ -10,6 +11,7 @@
 |---|---|
 | **입력 → 출력** | MP4(+강의노트 PDF) → 타임스탬프 Markdown |
 | **동작 방식** | 전부 로컬 (faster-whisper · Tesseract · ffmpeg). 업로드 없음, 용량 제한 없음 |
+| **온디바이스 추론** | 노트북 CPU만으로 (CUDA 없음) — 기본 모델 Whisper large-v3-turbo를 CTranslate2 **int8**로, 화면 OCR은 논리 코어 수만큼 병렬로 (12스레드에서 **5.8배**, 출력 바이트 단위 동일) |
 | **슬라이드 포착** | 합성 강의 48장 중 **48장, 실제 전환 시각 ±1초** (이전 판 39장) · 실강의 쪽 전환 **26/26** |
 | **처리 속도** | 실강의 1시간당 평균 약 23분 (한국어 강의 16~17분, 외국어 영상이 많은 강의 35분) |
 | **검증** | 단위 검증 152개 + 합성 강의 2편 종단 검증 47항목 + 실강의 3편(좌우 분할·전체 화면·겹침 구성) |
@@ -39,7 +41,8 @@ So this tool interleaves three channels in one document:
 Paragraphs break where the slide changes, so each explanation sits under the slide it refers to.
 Unsure paragraphs are marked `⚠`; audio from a video played *during* the lecture is marked `📺`.
 
-Runs fully offline on a laptop CPU (no CUDA). Windows-first; Korean UI.
+Runs fully offline on a laptop CPU (no CUDA): Whisper large-v3-turbo on CTranslate2 int8 by default, and
+slide OCR fanned out across all logical cores (5.8× faster on 12 threads, byte-identical output). Windows-first; Korean UI.
 Every design decision below was settled by measurement, and an end-to-end test builds a synthetic
 lecture with known answers (rendered slides, TTS narration, a played video clip) and grades the output.
 
