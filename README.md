@@ -411,7 +411,12 @@ MP4 입력/          ← 강의 영상을 넣는다 (하위 폴더 가능)
 Transcriber 실행.bat      실행 진입점 (영상을 끌어다 놓아도 된다)
 환경 설치.bat             최초 1회 설치
 설정.ini                  사용자 설정
-engine/transcribe.py      엔진 전체 (설정·전사·복구·전환 검출·OCR·PDF 정합·출력)
+engine/transcribe.py      흐름 — 설정·입력 고르기·전사·화면 읽기 실행·강의자료 찾기·출력 조립
+engine/speech_repair.py   빠진 말소리·흔들린 구간 다시 읽기, 구절 나누기
+engine/screen_scan.py     화면 전환 검출·프레임 고르기·화자 영역·OCR 판본 고르기·잡음 줄 정리
+engine/slide_pdf.py       강의자료 고르기·글자 2연쇄 정합·전문용어 목록
+engine/timeline.py        문단화·재생 영상(📺) 판정과 그 경계
+engine/md_writer.py       Markdown 산출물·다시 만들지 판정하는 마커
 engine/문단화_검증.py       단위 검증 152개
 engine/종단_검증.py         합성 강의로 끝까지 돌려 채점
 engine/setup_env.py       가상환경 생성 · 의존성 · 언어 데이터 · 점검
