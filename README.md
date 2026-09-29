@@ -46,6 +46,9 @@ slide OCR fanned out across all logical cores (5.8× faster on 12 threads, byte-
 Every design decision below was settled by measurement, and an end-to-end test builds a synthetic
 lecture with known answers (rendered slides, TTS narration, a played video clip) and grades the output.
 
+Built with an AI coding assistant (Claude Code), as the `Co-Authored-By` trailers show. Problem
+definition, measurement and verification on real lectures, and the decision to adopt each design are mine.
+
 </details>
 
 ---
@@ -430,6 +433,12 @@ engine/requirements.txt   버전 잠금
 산출물 끝에는 `<!-- transcriber: {...} -->` 마커가 붙는다. 다시 변환할지는 파일 날짜가
 아니라 이 마커로 판정하므로, **설정·강의자료·엔진이 바뀌면 자동으로 다시 만들고
 사용자가 손댄 결과물은 보존**한다.
+
+## 만든 방식
+
+코드와 문서는 AI 코딩 도구(Claude Code)와 함께 작성했다 — 커밋의 `Co-Authored-By` 표시가
+그 기록이다. 무엇을 풀지와 무엇을 받아들일지는 내가 정했다: 문제 정의, 실제 강의로 한 실측과
+검증, 그리고 각 설계를 채택할지의 판단이다.
 
 ---
 
