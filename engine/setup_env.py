@@ -90,6 +90,9 @@ def main() -> int:
         p = subprocess.run([str(VENV_PY), "-c", "import sys"], capture_output=True)
         if p.returncode == 0:
             say(f"\n이미 쓸 수 있는 환경이 있습니다: {VENV_DIR}")
+            # 지난번 설치가 중간에 실패했으면 패키지가 빠져 있다 — 이미 맞으면 몇 초 만에 끝난다
+            run([str(VENV_PY), "-m", "pip", "install", "-q", "-r", str(REQ)], "패키지 판 맞추기")
+            fetch_tessdata()
             return verify()
         say(f"\nvenv 가 있지만 이 PC에서 기동되지 않습니다 (다른 PC에서 만들어진 것).")
         say("  지우고 다시 만듭니다...")
@@ -144,15 +147,15 @@ def fetch_tessdata() -> bool:
         urllib.request.urlretrieve(TESSDATA_URL, zpath)
         with zipfile.ZipFile(zpath) as z:
             z.extractall(ENGINE_DIR)
-        zpath.unlink(missing_ok=True)
         say(f"    완료 → {dest}")
         return True
     except Exception as e:
-        zpath.unlink(missing_ok=True)
         say(f"    [실패] {type(e).__name__}: {e}")
         say("    전사는 정상 동작합니다. 한국어 슬라이드만 읽지 못합니다.")
         say(f"    직접 받으려면: {TESSDATA_URL}")
         return False
+    finally:
+        zpath.unlink(missing_ok=True)   # Ctrl+C 로 끊겨도 반쪽 zip 을 남기지 않는다
 
 
 def verify() -> int:

@@ -1,0 +1,23 @@
+# GitHub 가 이 파일을 읽어 저장소 페이지에 "Cite this repository" 를 띄운다 (Citation File Format 1.2.0).
+cff-version: 1.2.0
+message: "이 저장소를 인용할 때는 아래 정보를 써 주세요. / If you use this software, please cite it as below."
+type: software
+title: "lecture-transcriber: 강의 영상을 화면까지 읽은 타임스탬프 Markdown으로 옮기는 로컬 도구"
+authors:
+  - family-names: Choi
+    given-names: Minjoon
+    email: mijnch@gmail.com
+repository-code: "https://github.com/mijnch/lecture-transcriber"
+url: "https://github.com/mijnch/lecture-transcriber"
+license: MIT
+keywords:
+  - speech-recognition
+  - faster-whisper
+  - ctranslate2
+  - ocr
+  - tesseract
+  - markdown
+  - korean
+  - offline
+  - on-device
+abstract: "녹화 강의(MP4)를 faster-whisper(CTranslate2 int8)·Tesseract·ffmpeg만으로 노트북에서 전사하고, 화면 전환을 찾아 슬라이드 내용을 말과 시간순으로 엮으며, 믿을 수 없는 대목에 표식을 붙인다."

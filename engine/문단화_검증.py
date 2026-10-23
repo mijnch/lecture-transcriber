@@ -137,6 +137,14 @@ check("영상이 계속 움직였으면 사이의 번역·노래 구간도 같�
 still = [0.8 if 95 <= n <= 111 or 149 <= n <= 160 else 0.0 for n in range(300)]
 sp, _sc = T.add_language_spans([], scr, [(96.0, 110.0, "ko"), (150.0, 160.0, "ko")], still)
 check("사이에 화면이 멈췄으면 따로", sp == [(96.0, 110.0), (150.0, 160.0)], str(sp))
+short = [0.0] * 100
+short[95] = short[99] = 0.5
+try:
+    sp = T.add_language_spans([], [], [(95.0, 110.0, "ko")], short)
+    ok = True
+except IndexError as e:
+    ok, sp = False, e
+check("다른 언어 구간이 영상보다 길어도 죽지 않음", ok, str(sp))
 
 # 13-4) 오른쪽 화자 판정 — 슬라이드 쪽이 멈춘 동안 오른쪽이 움직여야 화자다.
 #       전체 화면 영상이 재생되면 좌우가 함께 움직이므로 그 시간은 빼고 본다.
@@ -626,6 +634,14 @@ check("괄호·쉼표가 있어도 통과",
 check("자료 이름에서 주차 파악",
       stem_week("7주차교재-표본통계학") == 7 and stem_week("7표본설계-표본통계학") == 7
       and stem_week("표본통계학") is None, str(stem_week("7주차교재-표본통계학")))
+check("연도·판 번호는 주차로 읽지 않음",
+      stem_week("재무관리 강의자료 2024") is None and stem_week("재무관리_v2") is None
+      and stem_week("2024 재무관리 7주차") == 7 and stem_week("재무관리 v2 12") == 12,
+      str([stem_week(s) for s in ("재무관리 강의자료 2024", "재무관리_v2", "재무관리 v2 12")]))
+check("길이를 어림하는 형식(헤더 없는 mp3·ADTS aac)만 잘림 검사를 경고로",
+      T.duration_is_estimate({"format": "mp3"}) and T.duration_is_estimate({"format": "aac"})
+      and not T.duration_is_estimate({"format": "mov,mp4,m4a,3gp,3g2,mj2"})
+      and not T.duration_is_estimate({"format": None}))
 
 # 36) 파일 이름에서 과목·주차·교시를 읽는다
 check("과목/주차/교시 파악",
@@ -634,6 +650,11 @@ check("과목/주차/교시 파악",
       and parse_course("특강") == ("특강", None, None))
 
 print("\n산출물 지문")
+cfg_on = {"model": "large-v3-turbo", "language": "auto", "beam_size": 1, "슬라이드_읽기": True, "ocr_언어": "자동"}
+check("Tesseract·ffprobe 가 없으면 지문이 '화면 읽기 끔' 으로 (설치 뒤 다시 만들어지게)",
+      T.config_fingerprint(T.effective_config(cfg_on, None, True)) != T.config_fingerprint(cfg_on)
+      and T.config_fingerprint(T.effective_config(cfg_on, "tess", False)) != T.config_fingerprint(cfg_on)
+      and T.effective_config(cfg_on, "tess", True) is cfg_on)
 
 # 37) 본문이 같으면 같은 지문, 마커가 달라도 무관하다
 body = "# 강의\n\n**[00:00:00]** 안녕하세요.\n"
@@ -670,6 +691,46 @@ with tempfile.TemporaryDirectory(prefix="mdcheck_", dir=T.tmp_root()) as td:
     T.unstage(T._STAGED)
     check("끌어다 놓기로 만든 이름은 치움", not (T.IN_DIR / "재무관리 1-3강.mp4").exists()
           and (outside / "재무관리 1-3강.mp4").exists())
+
+    # 다른 드라이브에서 복사하다 Ctrl+C 로 끊기면 반쪽 영상이 입력 폴더에 남지 않아야 한다
+    (outside / "재무관리 3-1강.mp4").write_bytes(b"v" * 4096)
+    real_link, real_copy = T.os.link, T.shutil.copy2
+    def no_link(*_a):
+        raise OSError("다른 볼륨")
+    def half_copy(src_, dst_):
+        Path(dst_).write_bytes(Path(src_).read_bytes()[:1000])
+        raise KeyboardInterrupt
+    T.os.link, T.shutil.copy2 = no_link, half_copy
+    try:
+        T.stage_dropped([outside / "재무관리 3-1강.mp4"])
+    except KeyboardInterrupt:
+        pass
+    finally:
+        T.os.link, T.shutil.copy2 = real_link, real_copy
+    T.unstage(T._STAGED)
+    check("복사 도중 끊겨도 반쪽 파일을 치움", not (T.IN_DIR / "재무관리 3-1강.mp4").exists())
+
+    # 강의자료: 이름에 셀 낱말이 없는 강의(講義.mp4)도 죽지 않고, 열 수 없는 압축 자료는 건너뛴다
+    (T.PDF_DIR / "재무관리 1주차.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    try:
+        hits = T.find_slide_pdfs(td / "講義.mp4")
+        ok = True
+    except ZeroDivisionError as e:
+        ok, hits = False, e
+    check("한·영·숫자 낱말이 없는 강의 이름도 자료 찾기가 죽지 않음", ok and hits == [], str(hits))
+    real_find, real_log = T.find_slide_pdfs, T.LOG_FILE
+    T.LOG_FILE = td / "기록.txt"
+    def boom():
+        raise NotImplementedError("That compression method is not supported")
+    T.find_slide_pdfs = lambda _src: [T.Material("묶음.zip/교재.pdf", "교재", 1, True, "묶음.zip", boom)]
+    try:
+        loaded, names = T.load_slide_materials(td / "재무관리 1-1강.mp4")
+        ok = loaded == [] and names == ["묶음.zip/교재.pdf"]
+    except Exception as e:
+        ok, loaded = False, e
+    finally:
+        T.find_slide_pdfs, T.LOG_FILE = real_find, real_log
+    check("풀 수 없는 압축 자료는 그 자료만 건너뜀 (강의는 계속)", ok, str(loaded))
 
     out = td / "재무관리 12-1강.md"
     src = td / "재무관리 12-1강.mp4"

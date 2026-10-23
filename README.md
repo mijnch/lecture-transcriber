@@ -14,7 +14,7 @@
 | **온디바이스 추론** | 노트북 CPU만으로 (CUDA 없음) — 기본 모델 Whisper large-v3-turbo를 CTranslate2 **int8**로, 화면 OCR은 논리 코어 수만큼 병렬로 (12스레드에서 **5.8배**, 출력 바이트 단위 동일) |
 | **슬라이드 포착** | 합성 강의 48장 중 **48장, 실제 전환 시각 ±1초** (이전 판 39장) · 실강의 쪽 전환 **26/26** |
 | **처리 속도** | 실강의 1시간당 평균 약 23분 (한국어 강의 16~17분, 외국어 영상이 많은 강의 35분) |
-| **검증** | 단위 검증 152개 + 합성 강의 2편 종단 검증 47항목 + 실강의 3편(좌우 분할·전체 화면·겹침 구성) |
+| **검증** | 단위 검증 159개 + 합성 강의 2편 종단 검증 47항목 + 실강의 3편(좌우 분할·전체 화면·겹침 구성) |
 | **실적** | 이전 판으로 실강의 9개 318분 무인 처리, 한글 슬라이드 3,160줄 중 **파손 0줄** |
 | **설치** | `환경 설치.bat` 더블클릭 |
 
@@ -43,8 +43,9 @@ Unsure paragraphs are marked `⚠`; audio from a video played *during* the lectu
 
 Runs fully offline on a laptop CPU (no CUDA): Whisper large-v3-turbo on CTranslate2 int8 by default, and
 slide OCR fanned out across all logical cores (5.8× faster on 12 threads, byte-identical output). Windows-first; Korean UI.
-Every design decision below was settled by measurement, and an end-to-end test builds a synthetic
-lecture with known answers (rendered slides, TTS narration, a played video clip) and grades the output.
+Every design decision below was settled by measurement, and an end-to-end test builds two synthetic
+lectures with known answers (rendered slides, TTS narration, three played video clips, a speaker
+standing over the slide) and grades 47 items of the output.
 
 Built with an AI coding assistant (Claude Code), as the `Co-Authored-By` trailers show. Problem
 definition, measurement and verification on real lectures, and the decision to adopt each design are mine.
@@ -283,11 +284,11 @@ Ryzen AI 5 435 (6C/12T), RAM 16GB, 내장 GPU (CUDA 불가 → CPU int8)
 engine\venv\Scripts\python engine\문단화_검증.py
 ```
 
-**단위 검증 152개**, 몇 초 안에 끝난다. 문단화·빠진 구간 찾기·화면 전환 검출·OCR 점수·
+**단위 검증 159개**, 몇 초 안에 끝난다. 문단화·빠진 구간 찾기·화면 전환 검출·OCR 점수·
 잘린 줄 이어 읽기·슬라이드 병합·PDF 정합·자막 구분·영상 경계·끌어다 놓기·산출물 형식을
 다룬다(다시 읽기는 가짜 모델로 확인한다). 가짜 입력으로
-`write_markdown`까지 돌려 머리말·차례·쪽번호·표식·마커 왕복을 확인한다. CI가 매 push마다
-Windows·Python 3.14에서 돌리고, 잠긴 의존성이 설치 가능한지도 확인한다.
+`write_markdown`까지 돌려 머리말·차례·쪽번호·표식·마커 왕복을 확인한다. CI가 main 에 push 하거나
+PR 을 열 때마다 Windows·Python 3.14에서 돌리고, 잠긴 의존성이 설치 가능한지도 확인한다.
 
 ```bash
 engine\venv\Scripts\python engine\종단_검증.py
@@ -296,7 +297,7 @@ engine\venv\Scripts\python engine\종단_검증.py
 **종단 검증** — 단위 검증으로는 단계 사이의 결함을 못 잡는다. 이 스크립트는 정답을 아는
 합성 강의 두 편을 만들어 엔진을 끝까지 돌리고 **47개 항목**을 채점한다. 약 5분.
 
-- **A** (3분) — 화자 창이 따로 있는 화면. Edge로 그린 슬라이드 9장, 음성 합성 나레이션, 한국어
+- **A** (약 3분 40초) — 화자 창이 따로 있는 화면. Edge로 그린 슬라이드 9장, 음성 합성 나레이션, 한국어
   강의 속 영어 설명, 재생 영상 셋(번인 자막이 있고 끝나며 다음 슬라이드로 서서히 바뀌는 영상,
   자막 없이 교수와 같은 언어로 말하고 출처 주소만 있는 인터뷰, 자막 없는 영어 영상), 이름에
   과목이 없는 LMS 묶음(zip) 속 강의노트 PDF
@@ -318,7 +319,7 @@ engine\venv\Scripts\python engine\종단_검증.py
 |---|---|---|
 | 슬라이드 누락·지연 | 전환 8번 중 1번만 검출, 2장 통째로 누락, 최대 20초 늦음 | 평균 차이(`scene`)는 글자 변화에 둔감 → 바뀐 화소 비율 + 움직이는 칸 제외 |
 | 슬라이드가 한 장씩 밀림 | 전환을 잡고도 전환 직전 화면을 읽음 | 고르는 패스(`fps` 반올림)와 읽는 패스(`-ss`)가 다른 프레임 → `round=up` |
-| 다른 언어 대목 소실 | 영어 설명 22초가 오류 없이 사라짐 | 파일 단위 언어 고정 → 낱말 없는 말소리 구간을 찾아 다시 읽기 |
+| 다른 언어 대목 소실 | 약 20초짜리 영어 설명이 오류 없이 사라짐(빠진 구간 실측 22초) | 파일 단위 언어 고정 → 낱말 없는 말소리 구간을 찾아 다시 읽기 |
 | 전문용어 힌트의 부작용 | 세그먼트 24개 → 7개, 문장부호 25개 → 5개 | PDF 문장이 그대로 프롬프트가 됨 → 쉼표로 나열한 용어 목록 |
 | 제목 슬라이드가 `📺` | 교수가 제목을 읽기만 해도 "재생된 영상" | 글자 겹침만 봄 → 화면이 움직일 때만 자막 |
 | 영상 직후 교수 말이 `📺` | "영상에서 보셨듯이…"가 교수의 말이 아니라고 표시 | 앞뒤 15초 여유 → 영상 끝을 다음 화면 시각으로 확정 |
@@ -420,7 +421,7 @@ engine/screen_scan.py     화면 전환 검출·프레임 고르기·화자 영�
 engine/slide_pdf.py       강의자료 고르기·글자 2연쇄 정합·전문용어 목록
 engine/timeline.py        문단화·재생 영상(📺) 판정과 그 경계
 engine/md_writer.py       Markdown 산출물·다시 만들지 판정하는 마커
-engine/문단화_검증.py       단위 검증 152개
+engine/문단화_검증.py       단위 검증 159개
 engine/종단_검증.py         합성 강의로 끝까지 돌려 채점
 engine/setup_env.py       가상환경 생성 · 의존성 · 언어 데이터 · 점검
 engine/requirements.txt   버전 잠금
