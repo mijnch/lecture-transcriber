@@ -205,6 +205,10 @@ PDF_NAME_RATIO = 0.50    # 파일 이름이 이만큼 겹치면 같은 강의의
 
 # 잘린 입력 판정 — 추출된 오디오가 원본 길이의 이 비율 미만이면 손상으로 본다
 TRUNCATION_TOLERANCE = 0.98
+# ffprobe 가 길이를 '첫 프레임 비트레이트 × 파일 크기' 로 어림하는 형식 — 헤더 없는 VBR mp3·ADTS aac 등.
+# 강의 녹음은 무음으로 시작해 첫 프레임이 작으므로 어림값이 실제의 두 배~수십 배로 나온다(실측 120초 → 251초·2,684초).
+# 이 형식에서는 잘림 검사를 오류가 아니라 경고로 둔다.
+ESTIMATED_DURATION_FORMATS = {"mp3", "aac", "mp2", "amr"}
 OCR_MIN_ALNUM = 0.55     # 글자 비율이 이보다 낮으면 잡음
 OCR_BARE_CONF = 75       # 한글 낱말도 영어 낱말도 없는 줄(숫자·기호뿐)은 이만큼 확신할 때만 싣는다 —
 # 수식·기호는 글자로 센다 — 'f(x) = ax + b' 같은 줄이 잡음으로 버려지는 것을 막는다
@@ -321,20 +325,24 @@ def probe_media(path: Path):
     컨테이너 길이는 영상 트랙을 따르므로, 끝에 무음 화면이 붙은 정상 녹화가
     '손상'으로 거부되는 일이 있었다. mp3에 붙은 앨범 표지 한 장은 영상이 아니다.
     """
-    info = {"duration": None, "audio_duration": None, "video": False}
+    info = {"duration": None, "audio_duration": None, "video": False, "format": None}
     exe = shutil.which("ffprobe")
     if not exe:
         return info
     try:
         r = subprocess.run(
             [exe, "-v", "error", "-show_entries",
-             "format=duration:stream=codec_type,duration:stream_disposition=attached_pic",
+             "format=duration,format_name:stream=codec_type,duration:stream_disposition=attached_pic",
              "-of", "json", str(path)],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=120, stdin=subprocess.DEVNULL)
         data = json.loads(r.stdout)
-    except Exception:
+    except Exception as e:
+        # 조용히 넘기면 잘림 검사와 화면 읽기가 이 파일만 소리 없이 꺼진다 — 기록에 남긴다
+        log(f"  ⚠ ffprobe 로 {path.name}을(를) 읽지 못했습니다 — {type(e).__name__}: {e} "
+            f"(잘림 검사·화면 읽기를 건너뜁니다)")
         return info
+    info["format"] = (data.get("format") or {}).get("format_name")
     try:
         info["duration"] = float(data["format"]["duration"])
     except (KeyError, TypeError, ValueError):
@@ -349,6 +357,11 @@ def probe_media(path: Path):
         elif kind == "video" and not (st.get("disposition") or {}).get("attached_pic"):
             info["video"] = True
     return info
+
+
+def duration_is_estimate(media) -> bool:
+    """ffprobe 의 길이가 실제로 잰 값이 아니라 비트레이트로 어림한 값인 형식인가."""
+    return (media.get("format") or "") in ESTIMATED_DURATION_FORMATS
 
 
 def extract_audio(src: Path, dst: Path, media):
@@ -378,9 +391,12 @@ def extract_audio(src: Path, dst: Path, media):
     # 오디오 트랙 길이와만 견준다. 영상이 더 긴 것은 정상이다(끝에 붙은 무음 화면 등).
     expect = media["audio_duration"]
     if expect and got < expect * TRUNCATION_TOLERANCE:
-        raise RuntimeError(
-            f"오디오가 {fmt_ts(expect)}인데 {fmt_ts(got)}까지만 읽혔습니다. "
-            f"파일이 손상되었거나 복사가 끝나지 않았습니다")
+        msg = f"오디오가 {fmt_ts(expect)}인데 {fmt_ts(got)}까지만 읽혔습니다."
+        if duration_is_estimate(media):
+            log(f"  ⚠ {src.name}: {msg} 이 형식({media['format']})의 길이는 어림값이라 "
+                f"잘림으로 보지 않고 진행합니다. 끝부분이 빠졌는지 결과를 확인하세요.")
+        else:
+            raise RuntimeError(f"{msg} 파일이 손상되었거나 복사가 끝나지 않았습니다")
     return True
 
 
@@ -673,6 +689,17 @@ def iter_materials():
                        lambda p=p, n=i.filename: zipfile.ZipFile(p).read(n))
 
 
+def effective_config(cfg, tess, has_ffprobe):
+    """실제로 쓸 수 있는 기능만 켠 설정. 산출물 지문(config_fingerprint)은 이것으로 만든다.
+
+    설정은 화면 읽기를 켰는데 Tesseract 나 ffprobe 가 없으면 화면을 읽지 못한다. 그때 지문에 '켬' 이
+    남으면, 나중에 Tesseract 를 설치해도 화면 없이 만든 MD 가 '이미 변환됨' 으로 건너뛰어진다.
+    """
+    if cfg["슬라이드_읽기"] and not (tess and has_ffprobe):
+        return dict(cfg, 슬라이드_읽기=False)
+    return cfg
+
+
 def find_slide_pdfs(src: Path):
     """이 강의에 해당할 수 있는 강의자료를 **모두** 찾는다.
 
@@ -693,8 +720,8 @@ def find_slide_pdfs(src: Path):
         if not have:
             continue
         flat = re.sub(r"[^0-9a-z가-힣]+", "", match_text.lower())
-        named = bool(course_key and course_key in flat) or (
-            len(want & have) / min(len(want), len(have)) >= PDF_NAME_RATIO)
+        named = bool(course_key and course_key in flat) or (   # 이름에 셀 낱말이 없으면(講義.mp4) 비율을 재지 않는다
+            bool(want) and len(want & have) / min(len(want), len(have)) >= PDF_NAME_RATIO)
         pw = stem_week(stem)
         if pw is None:
             pw = stem_week(match_text)
@@ -718,6 +745,11 @@ def load_slide_materials(src: Path):
             pages = read_pdf_pages(m.load())
         except (OSError, zipfile.BadZipFile, KeyError):
             pages = []
+        except (RuntimeError, NotImplementedError) as e:
+            # 암호가 걸린 zip(RuntimeError)·지원하지 않는 압축 방식(PPMd 등, NotImplementedError)·
+            # 열 수 없는 PDF — 이 자료만 건너뛴다. 강의 전체를 실패로 만들지 않는다.
+            log(f"  ⚠ 강의자료 {m.name}을(를) 열 수 없어 건너뜁니다 — {e}")
+            continue
         if pages and any(t.strip() for t in pages):
             loaded.append((m, pages))
         else:
@@ -758,15 +790,20 @@ def stage_dropped(paths):
                 continue
             chosen.append(dest)
             continue
+        # 먼저 적는다 — 복사 도중 Ctrl+C 로 끊겨도 반쪽 파일을 __main__ 이 치운다.
+        # 모듈 전역이라 어느 경로로 끝나든 __main__ 이 치울 수 있다.
+        _STAGED.append(dest)
         try:
             os.link(p, dest)                   # 같은 볼륨: 즉시
         except OSError:
+            print(f"  {p.name}: 다른 드라이브라 입력 폴더로 복사합니다 (큰 파일은 시간이 걸립니다)...")
             try:
                 shutil.copy2(p, dest)          # 다른 볼륨: 복사
             except OSError as e:
                 print(f"  건너뜀: {p.name} ({e})")
+                _STAGED.remove(dest)
+                dest.unlink(missing_ok=True)
                 continue
-        _STAGED.append(dest)   # 모듈 전역 — 어느 경로로 끝나든 __main__ 이 치울 수 있게 한다
         chosen.append(dest)
     return chosen
 
@@ -891,6 +928,8 @@ def transcribe_file(model, cfg, src: Path, out_path: Path, tmp_dir: Path, idx, t
             # print만 하면 창을 닫은 뒤 흔적이 없다. 기록에 남겨 사후 진단이 되게 한다.
             log(f"  ⚠ 슬라이드를 읽지 못했습니다: {out_path.name} — {e}"
                 f" (음성 전사는 정상 저장)")
+    elif cfg["슬라이드_읽기"] and tess:
+        print("  (영상 트랙이 없어 화면 읽기를 건너뜁니다)")
     screen_sec = time.monotonic() - t_screen
 
     chosen = pick_materials(slides, loaded)
@@ -1147,6 +1186,19 @@ def main():
         print(f"\n끌어다 놓은 {len(only)}개를 처리합니다.")
 
     cfg = load_config()
+    # 화면 읽기를 실제로 할 수 있는지 먼저 정한다 — 산출물 지문은 '실제로 한 것' 으로 만들어야
+    # Tesseract·ffprobe 를 나중에 설치했을 때 화면 없이 만든 MD 가 다시 만들어진다.
+    wanted_slides = cfg["슬라이드_읽기"]
+    tess = find_tesseract() if wanted_slides else None
+    if tess:
+        why = check_ocr_langs(tess, ocr_lang_options(cfg, "ko") + ocr_lang_options(cfg, "en"))
+        if why:
+            log(f"⚠ 슬라이드 읽기를 끕니다 — {why}")
+            tess = None
+    has_ffprobe = bool(shutil.which("ffprobe"))
+    if wanted_slides and not has_ffprobe:
+        print("⚠ ffprobe가 없어 파일 손상 검사와 슬라이드 읽기를 건너뜁니다.")
+    cfg = effective_config(cfg, tess, has_ffprobe)
     try:
         targets, skipped, blocked, ignored, rebuilt = plan_targets(cfg, only)
     except OSError as e:
@@ -1173,16 +1225,8 @@ def main():
               else f"\n\"{IN_DIR.name}\" 폴더에 영상이나 음성 파일을 넣고 다시 실행해주세요.")
         return 0
 
-    tess = find_tesseract() if cfg["슬라이드_읽기"] else None
-    if tess:
-        why = check_ocr_langs(tess, ocr_lang_options(cfg, "ko") + ocr_lang_options(cfg, "en"))
-        if why:
-            log(f"⚠ 슬라이드 읽기를 끕니다 — {why}")
-            tess = None
-    if cfg["슬라이드_읽기"] and not shutil.which("ffprobe"):
-        print("⚠ ffprobe가 없어 파일 손상 검사와 슬라이드 읽기를 건너뜁니다.")
-    slide_note = ("슬라이드 읽기 켬" if tess else
-                  "슬라이드 읽기 끔" if not cfg["슬라이드_읽기"] else
+    slide_note = ("슬라이드 읽기 켬" if cfg["슬라이드_읽기"] else
+                  "슬라이드 읽기 끔" if not wanted_slides else
                   "슬라이드 읽기 불가")
     print(f"\n변환 대상 {len(targets)}개 · {cfg['model']} · 언어 {cfg['language']} · {slide_note}")
     if rebuilt:

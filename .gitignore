@@ -30,3 +30,6 @@ __pycache__/
 
 # 중복 실행 방지 잠금 (런타임 산물)
 engine/.lock
+
+# 언어 데이터 내려받기 중 임시 파일 (끊기면 남을 수 있다)
+engine/_tessdata.zip

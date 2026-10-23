@@ -255,7 +255,7 @@ def add_language_spans(spans, screens, swapped, motion):
     def settled_start(a, b):
         # 영상다운 움직임(0.08 이상)이어야 한다 — 교수의 커서·판서(0.03~0.05)가 이어진 초를
         # 영상 시작으로 잡아, 기사를 읽는 교수의 말이 여전히 📺 가 됐다(실강의)
-        for k in range(int(a), int(b) + 1):
+        for k in range(int(a), min(int(b) + 1, len(motion))):   # 말소리 구간이 영상보다 길 수 있다
             w = motion[k:k + 5]
             if motion[k] >= 0.08 and sum(1 for m in w if m > 0.02) >= 4 and sum(w) / len(w) >= 0.08:
                 return max(a, k - 0.5)

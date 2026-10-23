@@ -31,13 +31,23 @@ def name_tokens(stem: str):
     return {w for w in re.sub(r"[^0-9a-z가-힣]+", " ", stem.lower()).split() if w}
 
 
+WEEK_MAX = 20   # '주차' 없이 숫자만 있을 때 주차로 볼 상한 — 2024(연도)·v2(판)를 주차로 읽지 않게
+
+
 def stem_week(stem: str):
-    """파일 이름에서 주차를 읽는다. '7주차교재' → 7, '7표본설계' → 7."""
+    """파일 이름에서 주차를 읽는다. '7주차교재' → 7, '7표본설계' → 7.
+
+    '주차' 가 없으면 v/V 뒤가 아닌 첫 숫자 중 1~WEEK_MAX 인 것만 주차로 본다 —
+    '강의자료 2024', '재무관리_v2' 를 다른 주차로 읽어 맞는 자료를 버리던 것을 막는다.
+    """
     m = re.search(r"(\d+)\s*주차", stem)
     if m:
         return int(m.group(1))
-    m = re.search(r"\d+", stem)
-    return int(m.group()) if m else None
+    for m in re.finditer(r"(?<![\dvV])\d+", stem):
+        n = int(m.group())
+        if 1 <= n <= WEEK_MAX:
+            return n
+    return None
 
 
 # 강의자료 한 건. name 은 표시·지문용("묶음.zip/교재.pdf"), stem 은 쪽 이름용,
